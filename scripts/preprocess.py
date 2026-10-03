@@ -58,7 +58,7 @@ def main(args=None):
     parser.add_argument(
         "--components",
         nargs="+",
-        choices=["hubert", "ecapa", "crepe", "f0", "mel", "vmel", "notes", "aligned"],
+        choices=["hubert", "ecapa", "crepe", "f0", "mel", "vmel", "wmel", "notes", "aligned"],
         default=["hubert", "ecapa", "crepe", "f0", "mel", "notes"],
     )
     args = parser.parse_args(args)
@@ -136,6 +136,31 @@ def main(args=None):
                 continue
             cache.save("vmel", it["split"], key, vocoder.mel(load_numpy(it["sing_wav"], vocoder.sr)))
             count_done["vmel"] += 1
+        del vocoder
+
+    # ---- WORLD-conversion mel: speech -> WORLD singing (annotated durations, Harvest F0) -> vocoder
+    #      mel, the extra input of the hybrid acoustic model. WORLD runs on CPU workers.
+    if "wmel" in args.components:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+
+        from baselines.world_baseline import convert
+        from features.vocoder import Vocoder
+
+        vocoder = Vocoder(device)
+        todo = [it for it in dataset
+                if args.force or not cache.exists("wmel", it["split"], f"{it['speaker_id']}_{it['utt_id']}")]
+        count_skipped["wmel"] = len(dataset) - len(todo)
+        with ProcessPoolExecutor(extract_cfg["f0"].get("workers", 4),
+                                 mp_context=multiprocessing.get_context("spawn")) as pool:
+            futures = [pool.submit(convert, it["read_wav"], it["read_phones"],
+                                   [p["duration"] for p in it["sing_phones"]],
+                                   cache.load("f0", it["split"], f"{it['speaker_id']}_{it['utt_id']}"),
+                                   data_cfg["sample_rate"]) for it in todo]
+            for it, fut in tqdm(zip(todo, futures), total=len(todo), desc="world mel"):
+                cache.save("wmel", it["split"], f"{it['speaker_id']}_{it['utt_id']}",
+                           vocoder.mel(fut.result().astype("float32")))
+                count_done["wmel"] += 1
         del vocoder
 
     for it in tqdm(dataset, desc="utterances"):

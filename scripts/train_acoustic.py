@@ -10,14 +10,18 @@ Per mel frame on the singing timeline (NSF-HiFiGAN frames, 44.1 kHz / 512 = 86.1
 Target: 128-bin log-mel of the real singing (cache "vmel"), L1 loss. The
 pretrained NSF-HiFiGAN vocoder turns predicted mel + melody F0 into audio.
 
-Writes (val + test speakers):
-  outputs/acoustic_oracle/   annotated sung phone durations
-  outputs/acoustic_pred/     Phase 2 predicted durations (results/duration_predictions.csv)
+--world-input (hybrid): the mel of the WORLD speech-to-singing conversion (cache
+"wmel") is a fourth input and the model predicts a residual on top of it, so it
+refines WORLD (which keeps the speaker's timbre) instead of generating from scratch.
+
+Writes (val + test speakers), <name> = "acoustic" or "hybrid":
+  outputs/<name>_oracle/     annotated sung phone durations
+  outputs/<name>_pred/       Phase 2 predicted durations (results/duration_predictions.csv)
   outputs/nsf_copysyn/       vocoder on the real mel (upper bound)
 
-Usage (GPU host, needs `preprocess.py --components vmel` first):
-    CUDA_VISIBLE_DEVICES=1 python scripts/train_acoustic.py
-    python scripts/train_acoustic.py --generate-only      # reuse checkpoints/acoustic.pt
+Usage (GPU host, needs `preprocess.py --components vmel [wmel]` first):
+    CUDA_VISIBLE_DEVICES=1 python scripts/train_acoustic.py [--world-input]
+    python scripts/train_acoustic.py --generate-only [--world-input]   # reuse checkpoints/<name>.pt
 """
 
 from __future__ import annotations
@@ -40,6 +44,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from data.annotations import parse_annotation  # noqa: E402
+from baselines.world_baseline import convert as world_convert  # noqa: E402
 from features.cache import FeatureCache  # noqa: E402
 from features.vocoder import Vocoder, interp_f0  # noqa: E402
 
@@ -49,6 +54,7 @@ FRAME_RATE = 44100 / 512
 SEG = 512             # training crop, frames (~5.9 s)
 OVERLAP = 128         # inference chunk overlap, frames
 F0_MIN, F0_MAX = 60.0, 1100.0
+MEL_FLOOR = float(np.log(1e-5))  # vocoder log-mel of silence
 
 
 # --------------------------------------------------------------------------- conditioning
@@ -83,8 +89,18 @@ def f0_coarse(f0: np.ndarray):
     return np.rint((m - lo) * 255 / (hi - lo)).astype(np.int64), uv.astype(np.int64)
 
 
-def build_utterance(row, cache, sung_durations=None) -> dict:
-    """Frame-level inputs + target for one song. sung_durations=None -> annotated durations."""
+def fit_frames(x: np.ndarray, n: int) -> np.ndarray:
+    """Crop or pad (with silence) a (T, n_mels) mel to n frames."""
+    if len(x) >= n:
+        return x[:n]
+    return np.concatenate([x, np.full((n - len(x), x.shape[1]), MEL_FLOOR, x.dtype)])
+
+
+def build_utterance(row, cache, sung_durations=None, world_mel=None) -> dict:
+    """Frame-level inputs + target for one song. sung_durations=None -> annotated durations.
+
+    world_mel: WORLD-conversion mel for the hybrid model (None -> no WORLD input).
+    """
     key = f"{row.speaker_id}_{row.utt_id}"
     read_ph, sing_ph = parse_annotation(row.read_txt), parse_annotation(row.sing_txt)
     mel = cache.load("vmel", row.split, key)
@@ -94,7 +110,8 @@ def build_utterance(row, cache, sung_durations=None) -> dict:
     else:
         sung_edges = np.concatenate([[0.0], np.cumsum(sung_durations)])
     coarse, uv = f0_coarse(f0)
-    return {
+    extra = {} if world_mel is None else {"wmel": fit_frames(world_mel, len(mel))}
+    return {**extra,
         "key": key, "split": row.split, "mel": mel, "f0": f0, "coarse": coarse, "uv": uv,
         "spk": cache.load("ecapa", row.split, key),
         "hub": warp_content(cache.load("hubert", row.split, key), phone_edges(read_ph), sung_edges, len(mel)),
@@ -102,20 +119,16 @@ def build_utterance(row, cache, sung_durations=None) -> dict:
 
 
 def to_device(u: dict, device) -> dict:
-    return {
-        "hub": torch.from_numpy(u["hub"]).to(device),
-        "coarse": torch.from_numpy(u["coarse"]).to(device),
-        "uv": torch.from_numpy(u["uv"]).to(device),
-        "spk": torch.from_numpy(u["spk"]).to(device),
-        "mel": torch.from_numpy(u["mel"]).to(device),
-    }
+    return {k: torch.from_numpy(u[k]).to(device) for k in ["hub", "coarse", "uv", "spk", "mel", "wmel"] if k in u}
 
 
 # ----------------------------------------------------------------------------------- model
 
 class AcousticModel(nn.Module):
-    def __init__(self, d=256, layers=6, heads=4, ffn=1024, kernel=31, n_mels=128, dropout=0.1):
+    def __init__(self, d=256, layers=6, heads=4, ffn=1024, kernel=31, n_mels=128, dropout=0.1,
+                 world_input=False):
         super().__init__()
+        self.world = nn.Linear(n_mels, d) if world_input else None
         self.content = nn.Sequential(nn.LayerNorm(768), nn.Linear(768, d))
         self.spk = nn.Linear(192, d)
         self.pitch = nn.Embedding(256, d)
@@ -123,12 +136,17 @@ class AcousticModel(nn.Module):
         self.conformer = Conformer(input_dim=d, num_heads=heads, ffn_dim=ffn, num_layers=layers,
                                    depthwise_conv_kernel_size=kernel, dropout=dropout)
         self.out = nn.Linear(d, n_mels)
+        if world_input:  # residual on the WORLD mel: start exactly at WORLD's output
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
 
-    def forward(self, hub, spk, coarse, uv):
+    def forward(self, hub, spk, coarse, uv, wmel=None):
         x = self.content(hub.float()) + self.spk(spk)[:, None] + self.pitch(coarse) + self.voicing(uv)
+        if self.world is not None:
+            x = x + self.world(wmel)
         lengths = torch.full((x.shape[0],), x.shape[1], device=x.device)
         x, _ = self.conformer(x, lengths)
-        return self.out(x)
+        return self.out(x) if self.world is None else wmel + self.out(x)
 
 
 @torch.no_grad()
@@ -142,7 +160,8 @@ def infer(model, g: dict) -> torch.Tensor:
     for s in range(0, T, SEG - OVERLAP):
         e = min(s + SEG, T)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            y = model(g["hub"][None, s:e], g["spk"][None], g["coarse"][None, s:e], g["uv"][None, s:e])[0].float()
+            wmel = g["wmel"][None, s:e] if "wmel" in g else None
+            y = model(g["hub"][None, s:e], g["spk"][None], g["coarse"][None, s:e], g["uv"][None, s:e], wmel)[0].float()
         w = torch.ones(e - s, 1, device=out.device)
         if s > 0:
             w[:OVERLAP, 0] = ramp[: e - s]
@@ -161,7 +180,7 @@ def val_l1(model, val) -> float:
 
 def sample_batch(train, lengths, batch, rng):
     picks = rng.choice(len(train), size=batch, p=lengths / lengths.sum())
-    cols = {k: [] for k in ["hub", "coarse", "uv", "mel"]}
+    cols = {k: [] for k in ["hub", "coarse", "uv", "mel", "wmel"] if k in train[0]}
     for k in picks:
         g = train[k]
         s = int(rng.integers(0, len(g["coarse"]) - SEG + 1))
@@ -186,6 +205,8 @@ def main(args=None):
     ap.add_argument("--gpu-mem-fraction", type=float, default=0.5,
                     help="cap on this process's share of the GPU (shared machine)")
     ap.add_argument("--generate-only", action="store_true")
+    ap.add_argument("--world-input", action="store_true",
+                    help="hybrid: refine the WORLD conversion mel (needs cache 'wmel')")
     args = ap.parse_args(args)
 
     device = "cuda"
@@ -199,16 +220,20 @@ def main(args=None):
     manifest = pd.read_csv(ROOT / data_cfg["cache_root"] / "split_manifest.csv", dtype={"utt_id": str})
 
     t0 = time.time()
-    utts = {r.speaker_id + "_" + r.utt_id: build_utterance(r, cache) for r in manifest.itertuples()}
+    name = "hybrid" if args.world_input else "acoustic"
+    wmel = (lambda r: cache.load("wmel", r.split, f"{r.speaker_id}_{r.utt_id}")) if args.world_input else (lambda r: None)
+    utts = {r.speaker_id + "_" + r.utt_id: build_utterance(r, cache, world_mel=wmel(r)) for r in manifest.itertuples()}
     gpu = {k: to_device(u, device) for k, u in utts.items()}
     train = [gpu[k] for k, u in utts.items() if u["split"] == "train"]
     val = [gpu[k] for k, u in utts.items() if u["split"] == "val"]
     lengths = np.array([len(g["coarse"]) for g in train], dtype=float)
     print(f"loaded {len(utts)} songs ({lengths.sum() / FRAME_RATE / 60:.0f} min train) in {time.time() - t0:.0f}s")
 
-    model = AcousticModel().to(device)
-    print(f"acoustic model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters")
-    ckpt_path = ROOT / "checkpoints" / "acoustic.pt"
+    model = AcousticModel(world_input=args.world_input).to(device)
+    print(f"{name} model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters")
+    if args.world_input:
+        print(f"WORLD-input val L1 (residual = 0): {np.mean([np.abs(u['wmel'] - u['mel']).mean() for u in utts.values() if u['split'] == 'val']):.4f}")
+    ckpt_path = ROOT / "checkpoints" / f"{name}.pt"
     ckpt_path.parent.mkdir(exist_ok=True)
 
     if not args.generate_only:
@@ -219,7 +244,7 @@ def main(args=None):
             model.train()
             b = sample_batch(train, lengths, args.batch, rng)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                pred = model(b["hub"], b["spk"], b["coarse"], b["uv"])
+                pred = model(b["hub"], b["spk"], b["coarse"], b["uv"], b.get("wmel"))
             loss = F.l1_loss(pred.float(), b["mel"])
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -239,7 +264,7 @@ def main(args=None):
                     print(f"early stop: no val improvement for {since_best} evaluations")
                     break
         (ROOT / "results").mkdir(exist_ok=True)
-        pd.DataFrame(log).to_csv(ROOT / "results" / "acoustic_train.csv", index=False)
+        pd.DataFrame(log).to_csv(ROOT / "results" / f"{name}_train.csv", index=False)
 
     ck = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ck["state_dict"])
@@ -249,7 +274,8 @@ def main(args=None):
     vocoder = Vocoder(device)
     preds = pd.read_csv(ROOT / "results" / "duration_predictions.csv").sort_values(["utt", "idx"])
     pred_durs = preds.groupby("utt")["transformer_notes"].apply(np.array).to_dict()
-    outs = {name: ROOT / "outputs" / name for name in ["acoustic_oracle", "acoustic_pred", "nsf_copysyn"]}
+    outs = {k: ROOT / "outputs" / d for k, d in
+            [("oracle", f"{name}_oracle"), ("pred", f"{name}_pred"), ("copysyn", "nsf_copysyn")]}
     for d in outs.values():
         d.mkdir(parents=True, exist_ok=True)
 
@@ -262,10 +288,15 @@ def main(args=None):
         mel_oracle = infer(model, gpu[key]).cpu().numpy()
         # predicted durations, rescaled to fill the melody (as in the WORLD baseline)
         durs = pred_durs[key] * (len(u["mel"]) / FRAME_RATE) / pred_durs[key].sum()
-        mel_pred = infer(model, to_device(build_utterance(r, cache, durs), device)).cpu().numpy()
-        write(outs["acoustic_oracle"] / f"{key}.wav", vocoder(mel_oracle, u["f0"]))
-        write(outs["acoustic_pred"] / f"{key}.wav", vocoder(mel_pred, u["f0"]))
-        write(outs["nsf_copysyn"] / f"{key}.wav", vocoder(u["mel"], u["f0"]))
+        world_pred = None
+        if args.world_input:  # WORLD conversion with the predicted durations
+            wav = world_convert(r.read_wav, parse_annotation(r.read_txt), durs,
+                                cache.load("f0", r.split, key), vocoder.sr).astype(np.float32)
+            world_pred = vocoder.mel(wav)
+        mel_pred = infer(model, to_device(build_utterance(r, cache, durs, world_pred), device)).cpu().numpy()
+        write(outs["oracle"] / f"{key}.wav", vocoder(mel_oracle, u["f0"]))
+        write(outs["pred"] / f"{key}.wav", vocoder(mel_pred, u["f0"]))
+        write(outs["copysyn"] / f"{key}.wav", vocoder(u["mel"], u["f0"]))
         print(f"{key}: mel L1 oracle {np.abs(mel_oracle - u['mel']).mean():.3f}  "
               f"predicted-dur {np.abs(mel_pred - u['mel']).mean():.3f}")
 
@@ -280,13 +311,13 @@ def main(args=None):
     sl = slice(s, s + int(10 * FRAME_RATE))
     fig, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
     for a, m, title in [(ax[0], utts[key]["mel"], "real singing"),
-                        (ax[1], infer(model, gpu[key]).cpu().numpy(), "Conformer (oracle durations)")]:
+                        (ax[1], infer(model, gpu[key]).cpu().numpy(), f"{name} Conformer (oracle durations)")]:
         a.imshow(m[sl].T, origin="lower", aspect="auto", cmap="magma", vmin=-11, vmax=1)
         a.set_title(f"{key}: {title}")
         a.set_ylabel("mel bin")
     ax[1].set_xlabel("frame (86 Hz)")
     plt.tight_layout()
-    fig_path = ROOT / data_cfg["figures_dir"] / f"acoustic_mel_{key}.png"
+    fig_path = ROOT / data_cfg["figures_dir"] / f"{name}_mel_{key}.png"
     plt.savefig(fig_path, dpi=120)
     print("-> " + ", ".join(str(d.relative_to(ROOT)) for d in outs.values()) + f", {fig_path.relative_to(ROOT)}")
 

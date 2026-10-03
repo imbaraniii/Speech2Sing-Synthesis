@@ -65,6 +65,11 @@ unzip nsf_hifigan_44.1k_hop512_128bin_2024.02.zip && cd ..
 python scripts/preprocess.py --components vmel
 CUDA_VISIBLE_DEVICES=1 python scripts/train_acoustic.py    # -> outputs/acoustic_{oracle,pred}/, nsf_copysyn/
 python scripts/evaluate.py --systems acoustic_oracle acoustic_pred nsf_copysyn world world_pred world_copysyn gt
+
+# 11. Hybrid: the Conformer refines the WORLD conversion (keeps speaker timbre and pitch)
+python scripts/preprocess.py --components wmel
+CUDA_VISIBLE_DEVICES=1 python scripts/train_acoustic.py --world-input    # -> outputs/hybrid_{oracle,pred}/
+python scripts/evaluate.py --systems hybrid_oracle hybrid_pred --csv results/eval_hybrid.csv
 ```
 
 > Vocoder weights (OpenVPI NSF-HiFiGAN) are CC BY-NC-SA 4.0: research use only.
@@ -86,6 +91,7 @@ features/cache/
 ├── f0/<split>/SPK_UTT.npy      # (T,) Harvest melody F0 Hz @ 100 Hz, 0 = unvoiced
 ├── mel/<split>/SPK_UTT.npy     # (T, 80) log-mel @ 172 Hz
 ├── vmel/<split>/SPK_UTT.npy    # (T, 128) NSF-HiFiGAN log-mel @ 86 Hz (acoustic target)
+├── wmel/<split>/SPK_UTT.npy    # (T, 128) same mel of the WORLD conversion (hybrid input)
 └── notes/<split>/SPK_UTT.npy   # note segments from f0/ [{midi, onset_time, ...}]
 ```
 
@@ -117,4 +123,4 @@ Frame rates are documented in `config/extract.yaml` under `frame_rates`
 | `baselines/world_baseline.py` | WORLD speech-to-singing baseline + copy-synthesis |
 | `scripts/evaluate.py` | objective metrics for generated singing |
 | `scripts/train_duration.py` | Phase 2 duration predictor + ratio baselines |
-| `scripts/train_acoustic.py` | Phase 3 Conformer acoustic model + generation |
+| `scripts/train_acoustic.py` | Phase 3 Conformer acoustic model (pure or `--world-input` hybrid) + generation |
