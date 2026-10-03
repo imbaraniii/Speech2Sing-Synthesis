@@ -74,9 +74,9 @@ def main():
     plt.figure(figsize=(8, 4))
     for mode, color in [("speech", "tab:blue"), ("singing", "tab:orange")]:
         d = ptab[ptab["mode"] == mode]["dur"]
-        plt.hist(d, bins=80, alpha=0.5, label=f"{mode} (median {d.median():.3f}s)",
+        plt.hist(d[d < 1.0], bins=80, alpha=0.5, label=f"{mode} (median {d.median():.3f}s)",
                  color=color, density=True)
-    plt.xlabel("phone duration (s)")
+    plt.xlabel("phone duration (s, phones under 1 s shown)")
     plt.ylabel("density")
     plt.title("Phone duration distribution: speech vs singing")
     plt.legend()
@@ -101,48 +101,42 @@ def main():
     plt.close()
     print("saved figures/duration_ratio_phones.png")
 
-    # ---- F0 range: speech (crepe on read) vs singing (crepe on sing) ----
-    # NOTE: crepe cache currently stores only sing F0. We optionally compute
-    # speech F0 here if not cached.
-    print("\nComputing speech F0 (may take a moment)...")
-    from features.crepe_f0 import extract_f0
+    # ---- F0 range: speech vs singing, one song per speaker (Harvest, the melody tracker) ----
+    print("\nComputing speech F0 with Harvest (one song per speaker)...")
+    from features.world_f0 import extract_f0_harvest
 
-    f0_stats = []
-    for it in dataset[:6]:  # subsample for speed
-        try:
-            key = f"{it['speaker_id']}_{it['utt_id']}"
-            f0_sing = cache.load("crepe", it["split"], key)
-            conf_sing = cache.load("crepe_conf", it["split"], key)
-            f0_read, conf_read = extract_f0(
-                it["read_wav"],
-                model_capacity=extract_cfg["crepe"]["model_capacity"],
-                hop_length=extract_cfg["crepe"]["hop_length"],
-                device=extract_cfg.get("device", "auto"),
-                sr=data_cfg["sample_rate"],
-            )
-            for label, f0, conf in [("speech", f0_read, conf_read), ("singing", f0_sing, conf_sing)]:
-                voiced = f0[conf >= 0.5]  # torchcrepe never outputs 0 Hz
-                if len(voiced):
-                    f0_stats.append({"mode": label, "f0": float(np.median(voiced)),
-                                     "min": float(np.min(voiced)), "max": float(np.max(voiced))})
-        except Exception as e:  # noqa: BLE001
-            print(f"  skipped {it['speaker_id']}_{it['utt_id']}: {e}")
-
-    if f0_stats:
-        sdf = pd.DataFrame(f0_stats)
-        plt.figure(figsize=(8, 4))
-        for mode, color in [("speech", "tab:blue"), ("singing", "tab:orange")]:
-            vals = sdf[sdf["mode"] == mode]["f0"]
-            plt.hist(vals, bins=30, alpha=0.5, label=f"{mode} median F0",
-                     color=color, density=True)
-        plt.xlabel("median voiced F0 (Hz)")
-        plt.ylabel("density")
-        plt.title("Median F0 distribution (sample of 6 utterances)")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(figures / "f0_range.png", dpi=120)
-        plt.close()
-        print("saved figures/f0_range.png")
+    fcfg = extract_cfg["f0"]
+    f0_rows = []
+    for spk in sorted({it["speaker_id"] for it in dataset}):
+        it = next(i for i in dataset if i["speaker_id"] == spk)
+        key = f"{spk}_{it['utt_id']}"
+        f0_read = extract_f0_harvest(it["read_wav"], fcfg["frame_period_ms"], fcfg["fmin"], fcfg["fmax"])
+        f0_sing = cache.load("f0", it["split"], key)
+        for mode, f0 in [("speech", f0_read), ("singing", f0_sing)]:
+            v = f0[f0 > 0]  # Harvest: 0 Hz = unvoiced
+            f0_rows.append({"speaker": spk, "mode": mode, "median": float(np.median(v)),
+                            "p5": float(np.percentile(v, 5)), "p95": float(np.percentile(v, 95))})
+    fdf = pd.DataFrame(f0_rows)
+    order = fdf[fdf["mode"] == "speech"].sort_values("median")["speaker"].tolist()
+    y = {spk: i for i, spk in enumerate(order)}
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    for mode, color, dy in [("speech", "#2a78d6", -0.15), ("singing", "#eb6834", 0.15)]:
+        d = fdf[fdf["mode"] == mode]
+        ys = [y[s] + dy for s in d["speaker"]]
+        ax.hlines(ys, d["p5"], d["p95"], color=color, lw=2, alpha=0.6)
+        ax.plot(d["median"], ys, "o", ms=8, color=color, mec="#fcfcfb", mew=2, label=f"{mode}: median, bar = 5–95%")
+    ax.set_yticks(range(len(order)), order)
+    ax.set_xscale("log")
+    ax.set_xticks([100, 150, 200, 300, 400, 600], ["100", "150", "200", "300", "400", "600"])
+    ax.set_xlabel("voiced F0 (Hz, log scale)")
+    ax.set_title("Speech vs singing pitch per speaker (one song each)")
+    ax.grid(axis="x", color="#e4e3df", lw=0.8)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(loc="lower right", frameon=False)
+    plt.tight_layout()
+    plt.savefig(figures / "f0_range.png", dpi=120)
+    plt.close()
+    print("saved figures/f0_range.png")
 
     # ---- phone inventory ----
     top_phones = ptab["phone"].value_counts().head(20)
