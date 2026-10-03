@@ -180,6 +180,8 @@ def main(args=None):
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--eval-every", type=int, default=1000)
+    ap.add_argument("--patience", type=int, default=8,
+                    help="stop after this many evaluations without val improvement")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gpu-mem-fraction", type=float, default=0.5,
                     help="cap on this process's share of the GPU (shared machine)")
@@ -212,7 +214,7 @@ def main(args=None):
     if not args.generate_only:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.steps, pct_start=0.05)
-        best, log, t0 = float("inf"), [], time.time()
+        best, since_best, log, t0 = float("inf"), 0, [], time.time()
         for step in range(1, args.steps + 1):
             model.train()
             b = sample_batch(train, lengths, args.batch, rng)
@@ -226,12 +228,16 @@ def main(args=None):
             sched.step()
             if step % args.eval_every == 0 or step == args.steps:
                 v = val_l1(model, val)
+                since_best += 1
                 if v < best:
-                    best = v
+                    best, since_best = v, 0
                     torch.save({"state_dict": model.state_dict(), "step": step, "val_l1": v}, ckpt_path)
                 log.append({"step": step, "train_l1": loss.item(), "val_l1": v})
                 print(f"step {step:6d}  train L1 {loss.item():.4f}  val L1 {v:.4f}  best {best:.4f}  "
                       f"({time.time() - t0:.0f}s, {torch.cuda.max_memory_allocated() / 2**30:.1f} GB)", flush=True)
+                if since_best >= args.patience:
+                    print(f"early stop: no val improvement for {since_best} evaluations")
+                    break
         (ROOT / "results").mkdir(exist_ok=True)
         pd.DataFrame(log).to_csv(ROOT / "results" / "acoustic_train.csv", index=False)
 
