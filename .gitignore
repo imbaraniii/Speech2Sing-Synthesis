@@ -1,0 +1,24 @@
+# dataset (research-only licence) and archives
+nus-smc-corpus_48/
+*.zip
+
+# environments
+env/
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+
+# downloaded models
+pretrained_models/
+vocoder/
+
+# generated artifacts (reproducible from scripts)
+features/cache/
+outputs/
+results/
+checkpoints/
+runs/
+*.wav
+data_study_stats.csv
+speaker_table.csv
