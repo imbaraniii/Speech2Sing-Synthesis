@@ -106,6 +106,7 @@ def main(args=None):
 
     # ---- Harvest F0 (song): slow per file, so run in parallel up front ----
     if "f0" in args.components:
+        import multiprocessing
         from concurrent.futures import ProcessPoolExecutor
 
         from features.world_f0 import extract_f0_harvest
@@ -114,7 +115,8 @@ def main(args=None):
         todo = [it for it in dataset
                 if args.force or not cache.exists("f0", it["split"], f"{it['speaker_id']}_{it['utt_id']}")]
         count_skipped["f0"] = len(dataset) - len(todo)
-        with ProcessPoolExecutor(fcfg.get("workers", 4)) as pool:
+        # spawn, not fork: forking after torch/CUDA init (HuBERT, ECAPA) deadlocks the workers on Linux
+        with ProcessPoolExecutor(fcfg.get("workers", 4), mp_context=multiprocessing.get_context("spawn")) as pool:
             futures = [pool.submit(extract_f0_harvest, it["sing_wav"], fcfg["frame_period_ms"],
                                    fcfg["fmin"], fcfg["fmax"]) for it in todo]
             for it, fut in tqdm(zip(todo, futures), total=len(todo), desc="harvest f0"):
