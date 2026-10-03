@@ -58,7 +58,7 @@ def main(args=None):
     parser.add_argument(
         "--components",
         nargs="+",
-        choices=["hubert", "ecapa", "crepe", "f0", "mel", "notes", "aligned"],
+        choices=["hubert", "ecapa", "crepe", "f0", "mel", "vmel", "notes", "aligned"],
         default=["hubert", "ecapa", "crepe", "f0", "mel", "notes"],
     )
     args = parser.parse_args(args)
@@ -120,6 +120,21 @@ def main(args=None):
             for it, fut in tqdm(zip(todo, futures), total=len(todo), desc="harvest f0"):
                 cache.save("f0", it["split"], f"{it['speaker_id']}_{it['utt_id']}", fut.result())
                 count_done["f0"] += 1
+
+    # ---- Vocoder mel (song): 128-bin NSF-HiFiGAN mel, the acoustic-model target ----
+    if "vmel" in args.components:
+        from features.audio import load_numpy
+        from features.vocoder import Vocoder
+
+        vocoder = Vocoder(device)
+        for it in tqdm(dataset, desc="vocoder mel"):
+            key = f"{it['speaker_id']}_{it['utt_id']}"
+            if cache.exists("vmel", it["split"], key) and not args.force:
+                count_skipped["vmel"] += 1
+                continue
+            cache.save("vmel", it["split"], key, vocoder.mel(load_numpy(it["sing_wav"], vocoder.sr)))
+            count_done["vmel"] += 1
+        del vocoder
 
     for it in tqdm(dataset, desc="utterances"):
         spk, utt, split = it["speaker_id"], it["utt_id"], it["split"]
