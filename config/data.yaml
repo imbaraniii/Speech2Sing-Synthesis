@@ -1,0 +1,15 @@
+data_root: "nus-smc-corpus_48"   # relative to the project root (run scripts from there)
+sample_rate: 44100
+
+splits:
+  strategy: "speaker_disjoint"   # or "leave_one_song_out"
+  train_speakers: 10
+  val_speakers: 1
+  test_speakers: 1
+  seed: 42
+
+# utterance_ids: auto-discovered per speaker from the corpus (each speaker
+# sings a different set of 4 songs, e.g. ADIZ: 01/09/13/18, JLEE: 05/08/11/15)
+
+cache_root: "features/cache"
+figures_dir: "figures"
