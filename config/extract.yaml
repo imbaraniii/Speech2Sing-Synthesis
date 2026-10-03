@@ -1,0 +1,43 @@
+device: "auto"   # auto | cpu | cuda | mps
+
+hubert:
+  model: "facebook/hubert-base-ls960"
+  layer: 9
+
+ecapa:
+  model: "speechbrain/spkrec-ecapa-voxceleb"
+  savedir: "pretrained_models/"
+
+crepe:
+  model_capacity: "tiny"    # tiny | full (full is ~10x slower on CPU/MPS)
+  hop_length: 160           # samples @ 16 kHz -> 100 Hz frame rate
+  fmin: 50.0
+  fmax: 2006.0
+  batch_size: 1024
+
+f0:                         # melody F0 used downstream (cache "f0"); CREPE kept for reference
+  method: "harvest"         # WORLD Harvest; torchcrepe-tiny fails on ~half the singers
+  frame_period_ms: 10       # -> 100 Hz, 0 Hz = unvoiced
+  fmin: 60.0
+  fmax: 1100.0
+  workers: 8
+
+mel:
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  n_mels: 80
+  fmin: 0
+  fmax: 22050
+  log_floor: 1e-5
+
+notes:
+  f0_stability_semitones: 1.0
+  min_note_frames: 3
+
+frame_rates:
+  hubert: 50      # 20 ms frames
+  crepe: 100      # hop=160 @ 16 kHz
+  f0: 100         # harvest, 10 ms frames
+  mel: 172        # hop=256 @ 44.1 kHz
+  target: 172     # acoustic model frame rate

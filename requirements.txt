@@ -1,0 +1,22 @@
+# Core
+numpy
+scipy
+pandas
+pyyaml
+tqdm
+matplotlib
+seaborn
+scikit-learn
+jupyter
+
+# Audio / deep learning
+torch>=2.0
+torchaudio
+librosa
+soundfile
+torchcrepe
+pyworld
+speechbrain
+
+# Pretrained models
+transformers
