@@ -41,6 +41,7 @@ warnings.filterwarnings("ignore", message="pkg_resources")
 import pyworld  # noqa: E402
 
 from data.annotations import parse_annotation  # noqa: E402
+from features.audio import load_numpy  # noqa: E402
 from features.cache import FeatureCache  # noqa: E402
 
 FRAME_MS = 5.0
@@ -90,10 +91,7 @@ def melody_f0(f0: np.ndarray, n_frames: int) -> np.ndarray:
 
 def convert(read_wav, read_phones, tgt_durations, f0_melody, sr) -> np.ndarray:
     """Speech -> singing with given per-phone target durations and melody F0."""
-    wav, file_sr = sf.read(read_wav)
-    assert file_sr == sr, f"{read_wav}: {file_sr} Hz != {sr} Hz"
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
+    wav = load_numpy(read_wav, sr)  # resamples (KENN's read/ files are 48 kHz) and mixes to mono
     _, sp, ap = world_analyse(wav, sr)
     idx = stretch_index(read_phones, tgt_durations)
     # interpolate the envelope in the log domain
@@ -105,10 +103,7 @@ def convert(read_wav, read_phones, tgt_durations, f0_melody, sr) -> np.ndarray:
 
 
 def copy_synthesis(sing_wav, sr) -> np.ndarray:
-    wav, _ = sf.read(sing_wav)
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
-    f0, sp, ap = world_analyse(wav, sr)
+    f0, sp, ap = world_analyse(load_numpy(sing_wav, sr), sr)
     return pyworld.synthesize(f0, sp, ap, sr, FRAME_MS)
 
 
