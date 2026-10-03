@@ -19,6 +19,8 @@ outputs/
 results/
 checkpoints/
 runs/
+logs/
+flac_in/
 *.wav
 data_study_stats.csv
 speaker_table.csv
