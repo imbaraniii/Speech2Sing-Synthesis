@@ -100,26 +100,34 @@ def fit_frames(x: np.ndarray, n: int) -> np.ndarray:
     return np.concatenate([x, np.full((n - len(x), x.shape[1]), MEL_FLOOR, x.dtype)])
 
 
-def build_utterance(row, cache, sung_durations=None, world_mel=None) -> dict:
-    """Frame-level inputs + target for one song. sung_durations=None -> annotated durations.
+def make_conditioning(hub, read_ph, sung_edges, f0_100hz, n_frames, spk, world_mel=None) -> dict:
+    """Frame-level model inputs on the singing timeline (shared by training and infer.py).
 
+    hub: speech HuBERT (50 Hz); read_ph: spoken phone annotation; sung_edges: phone
+    boundaries on the singing timeline; f0_100hz: melody Harvest F0; spk: ECAPA embedding;
     world_mel: WORLD-conversion mel for the hybrid model (None -> no WORLD input).
     """
+    f0 = frame_f0(f0_100hz, n_frames)
+    coarse, uv = f0_coarse(f0)
+    u = {"f0": f0, "coarse": coarse, "uv": uv, "spk": spk,
+         "hub": warp_content(hub, phone_edges(read_ph), sung_edges, n_frames)}
+    if world_mel is not None:
+        u["wmel"] = fit_frames(world_mel, n_frames)
+    return u
+
+
+def build_utterance(row, cache, sung_durations=None, world_mel=None) -> dict:
+    """Frame-level inputs + target for one corpus song. sung_durations=None -> annotated durations."""
     key = f"{row.speaker_id}_{row.utt_id}"
     read_ph, sing_ph = parse_annotation(row.read_txt), parse_annotation(row.sing_txt)
     mel = cache.load("vmel", row.split, key)
-    f0 = frame_f0(cache.load("f0", row.split, key), len(mel))
     if sung_durations is None:
         sung_edges = phone_edges(sing_ph)
     else:
         sung_edges = np.concatenate([[0.0], np.cumsum(sung_durations)])
-    coarse, uv = f0_coarse(f0)
-    extra = {} if world_mel is None else {"wmel": fit_frames(world_mel, len(mel))}
-    return {**extra,
-        "key": key, "split": row.split, "mel": mel, "f0": f0, "coarse": coarse, "uv": uv,
-        "spk": cache.load("ecapa", row.split, key),
-        "hub": warp_content(cache.load("hubert", row.split, key), phone_edges(read_ph), sung_edges, len(mel)),
-    }
+    u = make_conditioning(cache.load("hubert", row.split, key), read_ph, sung_edges,
+                          cache.load("f0", row.split, key), len(mel), cache.load("ecapa", row.split, key), world_mel)
+    return {"key": key, "split": row.split, "mel": mel, **u}
 
 
 def to_device(u: dict, device) -> dict:
@@ -199,6 +207,70 @@ def sample_batch(train, lengths, batch, rng):
     return out
 
 
+def load_data(manifest, cache, world_input: bool, device):
+    """All songs as frame-level dicts (CPU numpy) and on the GPU, plus train/val lists."""
+    wmel = (lambda r: cache.load("wmel", r.split, f"{r.speaker_id}_{r.utt_id}")) if world_input else (lambda r: None)
+    utts = {r.speaker_id + "_" + r.utt_id: build_utterance(r, cache, world_mel=wmel(r)) for r in manifest.itertuples()}
+    gpu = {k: to_device(u, device) for k, u in utts.items()}
+    train = [gpu[k] for k, u in utts.items() if u["split"] == "train"]
+    val = [gpu[k] for k, u in utts.items() if u["split"] == "val"]
+    return utts, gpu, train, val
+
+
+def generate_outputs(model, name, world_input, utts, gpu, manifest, cache, device, figures_dir):
+    """Render val + test songs: outputs/<name>_oracle, <name>_pred, nsf_copysyn, and a mel figure."""
+    vocoder = Vocoder(device)
+    preds = pd.read_csv(ROOT / "results" / "duration_predictions.csv").sort_values(["utt", "idx"])
+    pred_durs = preds.groupby("utt")["transformer_notes"].apply(np.array).to_dict()
+    outs = {k: ROOT / "outputs" / d for k, d in
+            [("oracle", f"{name}_oracle"), ("pred", f"{name}_pred"), ("copysyn", "nsf_copysyn")]}
+    for d in outs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    def write(path, wav):
+        sf.write(path, (0.9 * wav / max(np.abs(wav).max(), 1e-9)).astype(np.float32), vocoder.sr)
+
+    for r in manifest[manifest["split"].isin(["val", "test"])].itertuples():
+        key = f"{r.speaker_id}_{r.utt_id}"
+        u = utts[key]
+        mel_oracle = infer(model, gpu[key]).cpu().numpy()
+        # predicted durations, rescaled to fill the melody (as in the WORLD baseline)
+        durs = pred_durs[key] * (len(u["mel"]) / FRAME_RATE) / pred_durs[key].sum()
+        world_pred = None
+        if world_input:  # WORLD conversion with the predicted durations
+            wav = world_convert(r.read_wav, parse_annotation(r.read_txt), durs,
+                                cache.load("f0", r.split, key), vocoder.sr).astype(np.float32)
+            world_pred = vocoder.mel(wav)
+        mel_pred = infer(model, to_device(build_utterance(r, cache, durs, world_pred), device)).cpu().numpy()
+        write(outs["oracle"] / f"{key}.wav", vocoder(mel_oracle, u["f0"]))
+        write(outs["pred"] / f"{key}.wav", vocoder(mel_pred, u["f0"]))
+        write(outs["copysyn"] / f"{key}.wav", vocoder(u["mel"], u["f0"]))
+        print(f"{key}: mel L1 oracle {np.abs(mel_oracle - u['mel']).mean():.3f}  "
+              f"predicted-dur {np.abs(mel_pred - u['mel']).mean():.3f}")
+
+    # ---- figure: real vs generated mel, 10 s of the first test song
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    first = manifest[manifest["split"] == "test"].iloc[0]
+    key = f"{first.speaker_id}_{first.utt_id}"
+    s = int(np.argmax(utts[key]["uv"] == 0))  # first voiced frame
+    sl = slice(s, s + int(10 * FRAME_RATE))
+    fig, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+    for a, m, title in [(ax[0], utts[key]["mel"], "real singing"),
+                        (ax[1], infer(model, gpu[key]).cpu().numpy(), f"{name} Conformer (oracle durations)")]:
+        a.imshow(m[sl].T, origin="lower", aspect="auto", cmap="magma", vmin=-11, vmax=1)
+        a.set_title(f"{key}: {title}")
+        a.set_ylabel("mel bin")
+    ax[1].set_xlabel("frame (86 Hz)")
+    plt.tight_layout()
+    fig_path = ROOT / figures_dir / f"{name}_mel_{key}.png"
+    plt.savefig(fig_path, dpi=120)
+    plt.close(fig)
+    print("-> " + ", ".join(str(d.relative_to(ROOT)) for d in outs.values()) + f", {fig_path.relative_to(ROOT)}")
+
+
 # ------------------------------------------------------------------------------------ main
 
 def main(args=None):
@@ -232,11 +304,7 @@ def main(args=None):
     t0 = time.time()
     name = ("hybrid" if args.world_input else "acoustic") + ("_nopitch" if args.no_pitch else "") \
         + ("_nospk" if args.no_speaker else "")
-    wmel = (lambda r: cache.load("wmel", r.split, f"{r.speaker_id}_{r.utt_id}")) if args.world_input else (lambda r: None)
-    utts = {r.speaker_id + "_" + r.utt_id: build_utterance(r, cache, world_mel=wmel(r)) for r in manifest.itertuples()}
-    gpu = {k: to_device(u, device) for k, u in utts.items()}
-    train = [gpu[k] for k, u in utts.items() if u["split"] == "train"]
-    val = [gpu[k] for k, u in utts.items() if u["split"] == "val"]
+    utts, gpu, train, val = load_data(manifest, cache, args.world_input, device)
     lengths = np.array([len(g["coarse"]) for g in train], dtype=float)
     print(f"loaded {len(utts)} songs ({lengths.sum() / FRAME_RATE / 60:.0f} min train) in {time.time() - t0:.0f}s")
 
@@ -282,56 +350,7 @@ def main(args=None):
     model.load_state_dict(ck["state_dict"])
     print(f"using checkpoint from step {ck['step']} (val L1 {ck['val_l1']:.4f})")
 
-    # ---- generation: val + test speakers
-    vocoder = Vocoder(device)
-    preds = pd.read_csv(ROOT / "results" / "duration_predictions.csv").sort_values(["utt", "idx"])
-    pred_durs = preds.groupby("utt")["transformer_notes"].apply(np.array).to_dict()
-    outs = {k: ROOT / "outputs" / d for k, d in
-            [("oracle", f"{name}_oracle"), ("pred", f"{name}_pred"), ("copysyn", "nsf_copysyn")]}
-    for d in outs.values():
-        d.mkdir(parents=True, exist_ok=True)
-
-    def write(path, wav):
-        sf.write(path, (0.9 * wav / max(np.abs(wav).max(), 1e-9)).astype(np.float32), vocoder.sr)
-
-    for r in manifest[manifest["split"].isin(["val", "test"])].itertuples():
-        key = f"{r.speaker_id}_{r.utt_id}"
-        u = utts[key]
-        mel_oracle = infer(model, gpu[key]).cpu().numpy()
-        # predicted durations, rescaled to fill the melody (as in the WORLD baseline)
-        durs = pred_durs[key] * (len(u["mel"]) / FRAME_RATE) / pred_durs[key].sum()
-        world_pred = None
-        if args.world_input:  # WORLD conversion with the predicted durations
-            wav = world_convert(r.read_wav, parse_annotation(r.read_txt), durs,
-                                cache.load("f0", r.split, key), vocoder.sr).astype(np.float32)
-            world_pred = vocoder.mel(wav)
-        mel_pred = infer(model, to_device(build_utterance(r, cache, durs, world_pred), device)).cpu().numpy()
-        write(outs["oracle"] / f"{key}.wav", vocoder(mel_oracle, u["f0"]))
-        write(outs["pred"] / f"{key}.wav", vocoder(mel_pred, u["f0"]))
-        write(outs["copysyn"] / f"{key}.wav", vocoder(u["mel"], u["f0"]))
-        print(f"{key}: mel L1 oracle {np.abs(mel_oracle - u['mel']).mean():.3f}  "
-              f"predicted-dur {np.abs(mel_pred - u['mel']).mean():.3f}")
-
-    # ---- figure: real vs generated mel, 10 s of the first test song
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    first = manifest[manifest["split"] == "test"].iloc[0]
-    key = f"{first.speaker_id}_{first.utt_id}"
-    s = int(np.argmax(utts[key]["uv"] == 0))  # first voiced frame
-    sl = slice(s, s + int(10 * FRAME_RATE))
-    fig, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
-    for a, m, title in [(ax[0], utts[key]["mel"], "real singing"),
-                        (ax[1], infer(model, gpu[key]).cpu().numpy(), f"{name} Conformer (oracle durations)")]:
-        a.imshow(m[sl].T, origin="lower", aspect="auto", cmap="magma", vmin=-11, vmax=1)
-        a.set_title(f"{key}: {title}")
-        a.set_ylabel("mel bin")
-    ax[1].set_xlabel("frame (86 Hz)")
-    plt.tight_layout()
-    fig_path = ROOT / data_cfg["figures_dir"] / f"{name}_mel_{key}.png"
-    plt.savefig(fig_path, dpi=120)
-    print("-> " + ", ".join(str(d.relative_to(ROOT)) for d in outs.values()) + f", {fig_path.relative_to(ROOT)}")
+    generate_outputs(model, name, args.world_input, utts, gpu, manifest, cache, device, data_cfg["figures_dir"])
 
 
 if __name__ == "__main__":
