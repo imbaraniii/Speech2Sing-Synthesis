@@ -76,6 +76,14 @@ def cosine(a, b) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+def score_file(path, ref, f0_r, spk_ref, ecapa, fcfg, sr) -> dict:
+    """All metrics for one generated wav vs the real singing (ref waveform, its F0, read-speech ECAPA)."""
+    gen, _ = librosa.load(path, sr=sr)
+    f0_g = extract_f0_harvest(path, fcfg["frame_period_ms"], fcfg["fmin"], fcfg["fmax"])
+    return {"mcd_db": mcd(gen, ref, sr), **f0_metrics(f0_g, f0_r),
+            "spk_cos": cosine(extract_ecapa(path, ecapa), spk_ref)}
+
+
 def main(args=None):
     ap = argparse.ArgumentParser(description="Objective evaluation")
     ap.add_argument("--systems", nargs="+", default=["world", "world_copysyn", "gt"])
@@ -104,12 +112,8 @@ def main(args=None):
             if not path.exists():
                 print(f"  missing {path}, skipped")
                 continue
-            gen, _ = librosa.load(path, sr=sr)
-            f0_g = extract_f0_harvest(path, fcfg["frame_period_ms"], fcfg["fmin"], fcfg["fmax"])
             r = {"system": system, "split": row.split, "utt": key,
-                 "mcd_db": mcd(gen, ref, sr),
-                 **f0_metrics(f0_g, f0_r),
-                 "spk_cos": cosine(extract_ecapa(path, ecapa), spk_ref)}
+                 **score_file(path, ref, f0_r, spk_ref, ecapa, fcfg, sr)}
             rows.append(r)
             print(f"{system:14s} {key}: MCD {r['mcd_db']:5.2f}  F0 RMSE {r['f0_rmse_hz']:6.1f} Hz  "
                   f"CORR {r['f0_corr']:.3f}  spk {r['spk_cos']:.3f}")
