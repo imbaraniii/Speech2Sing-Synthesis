@@ -14,6 +14,10 @@ pretrained NSF-HiFiGAN vocoder turns predicted mel + melody F0 into audio.
 "wmel") is a fourth input and the model predicts a residual on top of it, so it
 refines WORLD (which keeps the speaker's timbre) instead of generating from scratch.
 
+Ablations: --no-pitch drops the melody input (pitch + voicing embeddings; the
+vocoder still gets F0), --no-speaker drops the ECAPA embedding. They add the
+suffix "_nopitch" / "_nospk" to the run name.
+
 Writes (val + test speakers), <name> = "acoustic" or "hybrid":
   outputs/<name>_oracle/     annotated sung phone durations
   outputs/<name>_pred/       Phase 2 predicted durations (results/duration_predictions.csv)
@@ -126,13 +130,13 @@ def to_device(u: dict, device) -> dict:
 
 class AcousticModel(nn.Module):
     def __init__(self, d=256, layers=6, heads=4, ffn=1024, kernel=31, n_mels=128, dropout=0.1,
-                 world_input=False):
+                 world_input=False, use_pitch=True, use_speaker=True):
         super().__init__()
         self.world = nn.Linear(n_mels, d) if world_input else None
         self.content = nn.Sequential(nn.LayerNorm(768), nn.Linear(768, d))
-        self.spk = nn.Linear(192, d)
-        self.pitch = nn.Embedding(256, d)
-        self.voicing = nn.Embedding(2, d)
+        self.spk = nn.Linear(192, d) if use_speaker else None
+        self.pitch = nn.Embedding(256, d) if use_pitch else None
+        self.voicing = nn.Embedding(2, d) if use_pitch else None
         self.conformer = Conformer(input_dim=d, num_heads=heads, ffn_dim=ffn, num_layers=layers,
                                    depthwise_conv_kernel_size=kernel, dropout=dropout)
         self.out = nn.Linear(d, n_mels)
@@ -141,7 +145,11 @@ class AcousticModel(nn.Module):
             nn.init.zeros_(self.out.bias)
 
     def forward(self, hub, spk, coarse, uv, wmel=None):
-        x = self.content(hub.float()) + self.spk(spk)[:, None] + self.pitch(coarse) + self.voicing(uv)
+        x = self.content(hub.float())
+        if self.spk is not None:
+            x = x + self.spk(spk)[:, None]
+        if self.pitch is not None:
+            x = x + self.pitch(coarse) + self.voicing(uv)
         if self.world is not None:
             x = x + self.world(wmel)
         lengths = torch.full((x.shape[0],), x.shape[1], device=x.device)
@@ -207,6 +215,8 @@ def main(args=None):
     ap.add_argument("--generate-only", action="store_true")
     ap.add_argument("--world-input", action="store_true",
                     help="hybrid: refine the WORLD conversion mel (needs cache 'wmel')")
+    ap.add_argument("--no-pitch", action="store_true", help="ablation: no melody (pitch/voicing) input")
+    ap.add_argument("--no-speaker", action="store_true", help="ablation: no ECAPA speaker input")
     args = ap.parse_args(args)
 
     device = "cuda"
@@ -220,7 +230,8 @@ def main(args=None):
     manifest = pd.read_csv(ROOT / data_cfg["cache_root"] / "split_manifest.csv", dtype={"utt_id": str})
 
     t0 = time.time()
-    name = "hybrid" if args.world_input else "acoustic"
+    name = ("hybrid" if args.world_input else "acoustic") + ("_nopitch" if args.no_pitch else "") \
+        + ("_nospk" if args.no_speaker else "")
     wmel = (lambda r: cache.load("wmel", r.split, f"{r.speaker_id}_{r.utt_id}")) if args.world_input else (lambda r: None)
     utts = {r.speaker_id + "_" + r.utt_id: build_utterance(r, cache, world_mel=wmel(r)) for r in manifest.itertuples()}
     gpu = {k: to_device(u, device) for k, u in utts.items()}
@@ -229,7 +240,8 @@ def main(args=None):
     lengths = np.array([len(g["coarse"]) for g in train], dtype=float)
     print(f"loaded {len(utts)} songs ({lengths.sum() / FRAME_RATE / 60:.0f} min train) in {time.time() - t0:.0f}s")
 
-    model = AcousticModel(world_input=args.world_input).to(device)
+    model = AcousticModel(world_input=args.world_input, use_pitch=not args.no_pitch,
+                          use_speaker=not args.no_speaker).to(device)
     print(f"{name} model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters")
     if args.world_input:
         print(f"WORLD-input val L1 (residual = 0): {np.mean([np.abs(u['wmel'] - u['mel']).mean() for u in utts.values() if u['split'] == 'val']):.4f}")
