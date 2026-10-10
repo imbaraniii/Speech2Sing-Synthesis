@@ -1,7 +1,7 @@
 # Speaker-Preserving Speech-to-Singing Synthesis — Project Report
 
 Complete account of the domain, what has been built, why, how it runs, and what it achieves.
-Status as of 2026-10-04.
+Status as of 2026-10-11.
 
 **How to read this document**
 
@@ -21,7 +21,7 @@ Status as of 2026-10-04.
 | B7. Pitch (F0) and how it is estimated | 7. WORLD baseline |
 | B8. Vocoders: classical (WORLD) and neural (HiFi-GAN, NSF) | 8. Phase 2 — duration model |
 | B9. Speech and singing synthesis systems | 9. Phase 3 — acoustic model |
-| B10. Machine learning foundations | 10. Results |
+| B10. Machine learning foundations | 10. Results (incl. ablations, GAN, regularisation, **Exp 2: a different melody**) |
 | B11. Sequence models: Transformer and Conformer | 11. Deliverables |
 | B12. Self-supervised speech representations (HuBERT) | 12. How to reproduce |
 | B13. Speaker embeddings (ECAPA-TDNN) | 13. Commit history |
@@ -782,6 +782,24 @@ assignment. Arbitrary new melodies need an automatic lyric-to-note aligner.
 
 Both runs overfit early. That's expected with 40 training songs; checkpoints are selected by validation L1.
 
+**Ablation runs (GPU 1, same settings, one input removed; §10.5):**
+
+| Run | Steps run (early stop) | Best step | Best val L1 |
+|---|---|---|---|
+| Pure, no melody input | 14,000 | 6,000 | 1.257 |
+| Pure, no speaker input | 15,000 | 7,000 | 0.950 |
+| Hybrid, no melody input | 21,000 | 13,000 | 1.151 |
+| Hybrid, no speaker input | 15,000 | 7,000 | 1.016 |
+
+**Regularisation runs (GPU 0, hybrid; §10.7):**
+
+| Run | Steps run | Best step | Best val L1 |
+|---|---|---|---|
+| EMA of weights (decay 0.999) | 24,000 (early stop) | 16,000 | 1.111 |
+| EMA + speaker-embedding noise 0.5σ | 40,000 (limit) | 40,000 | 1.040 |
+| EMA + speaker-embedding noise 1.0σ | 40,000 (limit) | 40,000 | 1.040 |
+| Learning rate 1e-4 (eval every 500, patience 12) | 7,000 (early stop) | 1,000 | 1.105 |
+
 ---
 
 ## 10. Results
@@ -838,8 +856,214 @@ Both runs overfit early. That's expected with 40 training songs; checkpoints are
 |---|---|
 | RQ1 Content | ✅ Time-warped HuBERT carries the lyrics; phone timing lines up in the output |
 | RQ2 Speaker | ⚠️→✅ Fails in the pure model; recovered by the hybrid (0.35 vs 0.44 for real singing) |
-| RQ3 Melody | ✅ Hybrid pitch error 13.3 Hz, correlation 0.93 (best of all systems) |
+| RQ3 Melody | ✅ Hybrid pitch error 13.3 Hz, correlation 0.93 (best of all systems); it also follows another singer's melody or a transposed one (0.90–0.92 correlation, Exp 2, §10.8) without taking on that singer's voice |
 | RQ4 Alignment | ✅ 90.8 ms phone duration error, 34% better than rule-based |
+
+### 10.5 Ablations — what each input contributes (Exp 4 and Exp 5)
+
+Each model was retrained with one input removed: the **melody** (pitch embedding and voicing flag;
+`--no-pitch`) or the **speaker** embedding (ECAPA; `--no-speaker`). Real durations throughout.
+
+| System | Test MCD ↓ | Test F0 RMSE (Hz) ↓ | Test F0 CORR ↑ | Test speaker ↑ | Val MCD | Val F0 RMSE | Val speaker |
+|---|---|---|---|---|---|---|---|
+| Pure Conformer (full) | 3.73 | 29.2 | 0.739 | 0.000 | 3.49 | 26.9 | 0.069 |
+| Pure, no melody | 4.03 | 43.4 | 0.409 | 0.008 | 3.71 | 76.2 | 0.117 |
+| Pure, no speaker | 3.73 | 12.9 | 0.936 | 0.110 | 3.37 | 12.2 | 0.186 |
+| Hybrid (full) | 4.12 | 13.3 | 0.931 | **0.354** | 3.64 | 16.7 | **0.401** |
+| Hybrid, no melody | 4.19 | 14.4 | 0.919 | 0.327 | 3.68 | 16.4 | 0.353 |
+| Hybrid, no speaker | **3.68** | **11.3** | **0.952** | 0.153 | **3.33** | **11.7** | 0.206 |
+
+**What this shows:**
+- **Melody input:**
+  - In the pure model, it is the only source of pitch. Without it, pitch tracking collapses (test correlation
+    0.74 → 0.41) and the harmonics blur into a flat average pitch (§15.12).
+  - The hybrid barely needs it (0.93 → 0.92). The WORLD mel already contains the melody's harmonics, so
+    the hybrid's pitch comes mostly from its WORLD input.
+- **Speaker input (ECAPA):**
+  - *Pure model:* removing ECAPA **improves** pitch a lot (29.2 → 12.9 Hz on test, 26.9 → 12.2 on val)
+    and even the speaker score (0.00 → 0.11). With only 10 training speakers, the embedding of an
+    unseen speaker is an input the model never saw, and it disturbs the output. This is the overfitting
+    behind the pure model's speaker collapse (§10.3).
+  - *Hybrid:* ECAPA is what keeps the voice. Without it, the speaker score halves (0.35 → 0.15), while MCD
+    and pitch improve. The model drifts towards an average singing voice, which is closer on average
+    spectra but less like the speaker.
+- **Takeaway:** the hybrid's design is confirmed. WORLD supplies melody and timbre; ECAPA anchors
+  identity. Trading identity for MCD (the no-speaker hybrid) defeats the project's goal, so the full hybrid
+  stays the main system.
+- **Caveats:**
+  - Single seed per run.
+  - Early stopping picked different points: the full hybrid at step 3,000 (still close to its WORLD
+    starting point, which has a high speaker score), the no-speaker hybrid at step 7,000. Part of the
+    hybrid's trade-off is "how far training moved away from WORLD", not the speaker input alone.
+
+### 10.6 Adversarial (GAN) fine-tuning — negative result
+
+`scripts/finetune_gan.py` (background: B14). This targets the over-smoothing / buzz noted in §15.10.
+
+**Setup:**
+- **Discriminator:** a 2-D patch discriminator on mel crops (0.43M parameters; LSGAN + feature matching).
+- **Generator loss:** `L1 + λ_adv · adversarial + 0.1 · feature-matching`.
+- **Runs:** the trained hybrid fine-tuned for 6,000 steps with λ_adv = 0.1 and 0.5. Snapshots at 2k, 4k and
+  6k steps.
+- **Gate (validation speaker JLEE only; the test speaker was never used):** a snapshot would replace the
+  hybrid only if MCD improves, F0 RMSE rises by ≤ 0.5 Hz and speaker similarity drops by ≤ 0.01.
+
+| Candidate (JLEE) | MCD ↓ | F0 RMSE (Hz) ↓ | F0 CORR ↑ | Speaker ↑ | Mel L1 ↓ |
+|---|---|---|---|---|---|
+| Hybrid (no GAN) | **3.64** | **17.0** | **0.917** | 0.401 | **1.114** |
+| λ 0.1, 2k steps | 4.07 | 17.1 | 0.917 | 0.431 | 1.220 |
+| λ 0.1, 4k steps | 4.40 | 18.0 | 0.908 | 0.428 | 1.298 |
+| λ 0.1, 6k steps | 4.46 | 20.2 | 0.892 | 0.445 | 1.304 |
+| λ 0.5, 2k steps | 4.11 | 18.3 | 0.907 | 0.419 | 1.230 |
+| λ 0.5, 4k steps | 4.45 | 20.3 | 0.889 | 0.416 | 1.293 |
+| λ 0.5, 6k steps | 4.55 | 18.0 | 0.907 | **0.452** | 1.324 |
+
+(The hybrid row matches §10.2 on MCD and speaker similarity to three decimals. Its F0 RMSE is 17.0 here vs
+16.7 there because the gate re-renders the audio, and tiny waveform differences shift a few Harvest
+pitch frames.)
+
+**Outcome:**
+- **No snapshot passed**, so no GAN checkpoint was saved and the hybrid remains the final model.
+- Every snapshot got worse on MCD and mel L1, increasingly with more steps. Pitch was the same or worse.
+- Only speaker similarity rose slightly (up to +0.05).
+- The training log was healthy (discriminator loss stayed around 0.35–0.49; it never "won"). The
+  problem is not unstable training.
+
+**Why:** the discriminator pushes towards sharper, more detailed spectra, but those details cannot be
+predicted exactly frame by frame. Frame-aligned MCD and L1 penalise every deviation, so they get worse
+even when the output is less smooth. Whether the GAN versions *sound* better can only be decided by a
+listening test. The rendered candidates are kept on the server in `outputs/gan_val/` for that purpose.
+
+### 10.7 Regularisation — no variant passes; a speaker-vs-MCD trade-off
+
+`scripts/train_acoustic.py --ema / --spk-noise / --lr`. The hybrid overfits after 3,000 steps (§9.3). Three
+standard fixes were tried, under the same validation gate as §10.6:
+- **EMA:** the saved model is an exponential moving average of the weights (decay 0.999).
+- **Speaker-embedding noise:** Gaussian noise on the ECAPA input during training, scaled by the per-dimension
+  standard deviation over the training songs, so the model cannot memorise the 10 training speakers.
+- **Lower learning rate:** 1e-4 instead of 5e-4, evaluated every 500 steps.
+
+| Hybrid variant | Val MCD ↓ | Val F0 RMSE (Hz) ↓ | Val speaker ↑ | Test MCD | Test F0 RMSE | Test speaker | Gate |
+|---|---|---|---|---|---|---|---|
+| **Hybrid (final)** | **3.64** | 16.7 | 0.401 | **4.12** | 13.3 | 0.354 | — |
+| EMA | 3.66 | 16.1 | 0.270 | 4.43 | 13.0 | 0.296 | ✗ MCD, speaker |
+| EMA + noise 0.5σ | 3.28 | **11.8** | 0.207 | 3.68 | **12.1** | 0.153 | ✗ speaker |
+| EMA + noise 1.0σ | 3.30 | 13.3 | 0.204 | 3.70 | 12.9 | 0.150 | ✗ speaker |
+| Learning rate 1e-4 | 3.81 | 17.2 | **0.564** | 4.21 | 16.9 | **0.615** | ✗ MCD |
+
+**What this shows (figure: `figures/tradeoff_mcd_speaker.png`, §15.13):**
+- **Speaker noise = no speaker input.** Both noise levels land on the no-speaker ablation of §10.5 (val MCD 3.33,
+  speaker 0.206): the model learns to ignore a noisy embedding. MCD and pitch improve, the voice is lost.
+- **The lower learning rate stays near WORLD.** Its best checkpoint (step 1,000) has moved little from the WORLD
+  input, so it keeps the speech timbre (speaker 0.56–0.62) and WORLD's weaker pitch and MCD.
+- **EMA** only delays overfitting: the averaged model peaks later (16,000 steps) at the same val L1 and is worse
+  on every metric.
+- **Every variant moves along one curve:** lower MCD comes with lower speaker similarity. None is better on
+  both, so the final hybrid stays. It sits in the middle of the curve, close to real singing's similarity on
+  test (0.35 vs 0.44).
+- **Speaker scores above real singing are not a win.** The metric compares with the *spoken* voice, so a
+  speech-like output (WORLD 0.66, lr 1e-4 0.62) scores above real singing (0.44) (§10.3).
+- **Since nothing passed,** `--ema` and `--spk-noise` were not committed (they exist only in the working copy);
+  the runs are documented here.
+
+### 10.8 Exp 2 — a different melody
+
+`scripts/exp2_melody.py`. Exp 1 always used the speaker's *own* melody. Exp 2 tests the actual objective (§1):
+the melody is controlled independently of the speaker.
+
+**Conditions (all 8 val/test songs, JLEE and VKOW):**
+- **Cross-singer, 20 pairs:** the speaker's spoken lyrics sung to *another singer's* rendition of the same song
+  (every other singer in the corpus who sang it).
+  - The melody is moved by whole octaves towards the speaker: 12 × round(log2 of the ratio of the two speaking
+    voices' median F0). That is −12 semitones for 14 pairs (a higher-voiced singer's melody for a lower-voiced
+    speaker) and 0 for 6.
+- **Transposed own melody, 3 per song:** −3, 0 and +3 semitones. The 0 case is the control and must reproduce Exp 1.
+- **Every condition** is rendered by WORLD, the pure and the hybrid model, each with three timings
+  (`infer.py --durations`):
+  - `reference`: the melody singer's phone timing;
+  - `phrase`: predicted with the melody's rests kept in place (described below);
+  - `predicted`: predicted and stretched to the melody's length.
+- 44 conditions × 9 renderings = 396 outputs, about 2.5 min each.
+
+**Finding: renditions of the same song differ in their lyrics.**
+- Two singers' annotations of the same song never have identical phone sequences. Only 77–89% of the phones
+  match: singers repeat or skip chorus lines, and the phone transcriptions differ in places.
+- `infer.py` now aligns the two annotations phone by phone, by minimum edit distance (Levenshtein).
+  - Python's `difflib` was tried first and failed. Its greedy matching paired a repeated chorus with the wrong
+    repeat (14% matched on one pair).
+  - Matched phones copy the melody singer's timing exactly. A mismatched stretch shares its sung time among its
+    spoken phones in proportion to their spoken durations.
+- **Safety check:** inference refuses pairs with under 70% matched phones. Different songs in the corpus
+  match ≤ 56%.
+- **Clean region:** each cross pair is cut to the longest stretch whose differences are at most 5 phones each,
+  starting and ending at a pause both annotations share. On average this keeps 166 s (113–190 s) of the song.
+
+**Metrics.** There is no real singing to compare with, except in the 0-shift control:
+- **Melody adherence:** F0 RMSE in cents and F0 correlation of the output against the (shifted) melody F0.
+- **Speaker similarity:** ECAPA cosine to the speaker's own speech.
+- **Leakage:** ECAPA cosine to the *melody singer's* speech. This checks whether the output takes on the melody
+  singer's voice. For comparison, the two speakers' own voices have a cosine of 0.166 on average.
+
+**Results (reference timing, mean over songs):**
+
+| Condition | System | F0 RMSE (cents) ↓ | F0 CORR ↑ | Speaker ↑ | Leakage (vs 0.166) ↓ |
+|---|---|---|---|---|---|
+| Own melody (Exp 1 control) | WORLD | 167 | 0.903 | 0.628 | — |
+| | Pure | 272 | 0.746 | 0.035 | — |
+| | **Hybrid** | **141** | **0.922** | 0.377 | — |
+| Own melody −3 semitones | WORLD | 153 | 0.903 | 0.681 | — |
+| | **Hybrid** | **144** | **0.909** | 0.393 | — |
+| Own melody +3 semitones | WORLD | 181 | 0.896 | 0.547 | — |
+| | **Hybrid** | **145** | **0.916** | 0.342 | — |
+| **Another singer's melody (20 pairs)** | WORLD | 176 | 0.896 | 0.679 | 0.126 |
+| | Pure | 329 | 0.649 | 0.026 | 0.094 |
+| | **Hybrid** | **166** | **0.899** | 0.408 | **0.086** |
+
+**What this shows:**
+- **The control reproduces Exp 1 exactly:** hybrid MCD 3.64 (JLEE) and 4.12 (VKOW), the same as §10.1–10.2.
+- **The hybrid follows a new melody:**
+  - Pitch accuracy stays within 4 cents of the own melody when transposed by ±3 semitones.
+  - With another singer's melody it stays within 25 cents. That melody is a different performance, with its own
+    timing, vibrato and octave move.
+  - The hybrid tracks the melody best of all three systems in every condition. WORLD gets worse at +3 semitones
+    (167 → 181 cents), while the hybrid barely changes (141 → 145).
+- **The voice stays the speaker's, not the melody singer's:**
+  - Hybrid speaker similarity is the same with another singer's melody (0.41) as with the own melody (0.38).
+  - Leakage to the melody singer is 0.086, *below* the 0.166 similarity of the two singers' own voices. The output
+    is less like the melody singer than the speaker's own speech is. This holds in 18 of 20 pairs (phrase timing).
+  - The melody carries only pitch and timing, no timbre. That is by design: F0 is the only input taken from the
+    melody audio.
+- **Pitching up costs some speaker similarity** (hybrid 0.38 → 0.34 at +3, WORLD 0.63 → 0.55). Pitching down
+  costs none. Higher pitch moves the harmonics further from the speaker's spoken formant pattern, which ECAPA
+  picks up.
+- **The pure model stays unusable** (F0 correlation 0.65, speaker 0.03), as in Exp 1.
+
+**System improvement: phrase timing (`--durations phrase`).**
+- **The problem:** with fully predicted timing (`predicted`), small duration errors add up over a song. The
+  median phrase started 2.8 s away from the melody's phrase, so lyrics drifted across the melody's rests.
+- **The fix:** `phrase` keeps every melody rest (a pause ≥ 0.5 s) at its reference position and length. Each
+  phrase between rests gets the predicted durations, rescaled to the phrase's span in the melody. This is how a
+  singer reads a score: rests are fixed, and timing inside a phrase is free.
+- **Result:** the phrase-boundary error drops from 2.8 s to about 0.33 s (median per song 0.13–0.89 s).
+
+| Own melody, vs real singing (8 songs) | Timing | MCD ↓ | F0 RMSE (cents) ↓ |
+|---|---|---|---|
+| WORLD | predicted → **phrase** | 6.05 → **5.35** | 223 → **196** |
+| Pure | predicted → **phrase** | 4.88 → **4.46** | 282 → 288 |
+| Hybrid | predicted → **phrase** | 5.28 → **4.76** | 185 → **165** |
+| Hybrid | reference (oracle, upper bound) | 3.88 | 141 |
+
+- Phrase timing improves the fully automatic MCD of all three systems by 0.4–0.7 dB. It closes about a third of
+  the gap to reference timing.
+- It also improves pitch adherence with another singer's melody (hybrid 203 → 175 cents).
+- It needs nothing beyond what `predicted` already uses: the rests come from the melody's annotation, which
+  `predicted` needs anyway to match notes to phones.
+
+**Caveats:**
+- The melody still comes from an annotated rendition of the *same* song. A truly new song needs automatic
+  lyric-to-note alignment (§14).
+- Exp 2 has no listening test. Leakage and speaker similarity are ECAPA scores, which §10.3 shows are inflated
+  for speech-like outputs.
 
 ---
 
@@ -847,11 +1071,14 @@ Both runs overfit early. That's expected with 40 training songs; checkpoints are
 
 | Item | Location |
 |---|---|
-| Demo clips: 3 songs × 10 versions (spoken input → WORLD → pure → hybrid → real singing) | `outputs/demo/` (Mac) |
+| Demo clips: all 8 val/test songs × 10 versions, same 25 s lyric window (spoken input → WORLD → pure → hybrid → real singing) | `outputs/demo/` (Mac), `scripts/make_demos.py` |
+| Inference CLI: spoken lyrics + reference singing (any singer, transposable) → the speaker singing, from raw audio | `infer.py` |
+| Exp 2: 44 different-melody conditions × 3 systems × 3 timings | `outputs/exp2/` (server), `results/exp2{,_summary}.csv` |
+| Exp 2 listening excerpts (25 s): cross-singer and ±3 semitone examples | `outputs/exp2_demo/` (Mac) |
 | Full generated songs | `outputs/{world,world_pred,acoustic_*,hybrid_*,nsf_copysyn}/` |
-| Metrics | `results/eval*.csv`, `results/duration*.csv` |
-| Training curves | `results/acoustic_train.csv`, `results/hybrid_train.csv` |
-| Figures | `figures/duration_pred_VKOW_05.png`, `figures/acoustic_mel_VKOW_05.png`, `figures/hybrid_mel_VKOW_05.png`, data study plots |
+| Metrics | `results/eval*.csv` (incl. `eval_ablation*.csv`, `eval_hybrid_{ema,ema_spk05,ema_spk10,lr1}*.csv`), `results/duration*.csv`, `results/gan_gate.csv` |
+| Training curves | `results/{acoustic,hybrid}{,_nopitch,_nospk}_train.csv` |
+| Figures | `figures/duration_pred_VKOW_05.png`, `figures/{acoustic,hybrid}{,_nopitch,_nospk}_mel_VKOW_05.png`, `figures/tradeoff_mcd_speaker.png`, data study plots |
 | Checkpoints | `checkpoints/duration.pt` (Mac), `checkpoints/{acoustic,hybrid}.pt` (server) |
 
 ---
@@ -880,6 +1107,24 @@ CUDA_VISIBLE_DEVICES=0 python scripts/train_acoustic.py --world-input    # hybri
 # Evaluation
 python scripts/evaluate.py --systems acoustic_oracle acoustic_pred nsf_copysyn world world_pred world_copysyn gt
 python scripts/evaluate.py --systems hybrid_oracle hybrid_pred --csv results/eval_hybrid.csv
+
+# Ablations (§10.5): --no-pitch / --no-speaker, with and without --world-input
+CUDA_VISIBLE_DEVICES=1 python scripts/train_acoustic.py --no-pitch
+CUDA_VISIBLE_DEVICES=1 python scripts/train_acoustic.py --world-input --no-speaker
+python scripts/evaluate.py --systems acoustic_nopitch_oracle acoustic_nospk_oracle \
+    hybrid_nopitch_oracle hybrid_nospk_oracle --csv results/eval_ablation.csv
+
+# GAN fine-tuning + validation gate (§10.6) -> results/gan_gate.csv
+CUDA_VISIBLE_DEVICES=1 python scripts/finetune_gan.py
+
+# Exp 2 (§10.8) -> outputs/exp2/, results/exp2{,_summary}.csv
+CUDA_VISIBLE_DEVICES=0 python scripts/exp2_melody.py
+
+# Demo excerpts and inference on new audio
+python scripts/make_demos.py
+python infer.py --speech read/05.wav --speech-phones read/05.txt \
+                --melody sing/05.wav --melody-phones sing/05.txt --out out.wav \
+                [--model hybrid|acoustic|world] [--durations reference|phrase|predicted] [--transpose -12]
 ```
 
 ---
@@ -887,6 +1132,15 @@ python scripts/evaluate.py --systems hybrid_oracle hybrid_pred --csv results/eva
 ## 13. Commit history
 
 ```
+feat(exp2): added the different-melody experiment on 20 cross-singer pairs and ±3 semitone shifts, where the hybrid follows the new melody (0.90 F0 correlation) without taking on the melody singer's voice (0.09 vs 0.17 speaker similarity).
+feat(infer): aligned another singer's annotation by minimum edit distance and added melody transposition, the WORLD system and rest-anchored phrase timing (own-melody MCD 5.28 to 4.76 dB vs predicted durations).
+chore(figures): added the test-song mel-spectrogram figures of the four melody and speaker ablation models.
+feat(gan): added validation-gated adversarial fine-tuning of the hybrid with a mel patch discriminator, which no snapshot passed (val MCD 3.64 dB rose to 4.07-4.55 dB).
+feat(infer): added an end-to-end inference CLI that turns spoken lyrics plus a reference singing into the speaker's singing from raw audio.
+refactor(acoustic): shared the conditioning, data loading and generation code so inference reuses the training path (outputs reproduce at 0.9999 correlation).
+feat(acoustic): added melody and speaker ablations, finding that ECAPA conditioning hurts unseen-speaker pitch (test F0 RMSE 29.2 to 12.9 Hz without it).
+feat(demo): added a script that cuts aligned listening excerpts of every validation and test song for all systems.
+docs(report): added the project report with domain background, an input-to-output walkthrough, explained figures and results.
 fix(analysis): replaced the empty CREPE F0 range plot with a per-speaker Harvest speech-vs-singing comparison and trimmed the duration histogram to phones under 1 s.
 feat(hybrid): trained a 9.52M parameter Conformer that refines the WORLD conversion, raising test speaker similarity from 0.00 to 0.35 and F0 correlation to 0.93.
 feat(acoustic): added early stopping on validation L1 with a patience of 8 evaluations.
@@ -912,11 +1166,14 @@ chore(git): ignored the dataset, feature cache, environments and generated artif
 
 | Limitation | Next step |
 |---|---|
-| Output is somewhat over-smoothed / muffled (an L1-loss artefact) | adversarial (GAN) loss on the mel, as listed in `approach.md` |
-| Phone→note matching uses sung timing | automatic lyric-to-note alignment for arbitrary new melodies |
+| Output is somewhat over-smoothed / muffled (an L1-loss artefact) | A mel GAN fine-tune was tried (§10.6) and made every objective metric except speaker similarity worse. Next: judge the GAN versions by listening, or try a GAN-trained / diffusion decoder instead of fine-tuning |
+| ECAPA conditioning fails for unseen speakers in the pure model (§10.5) | more training speakers; speaker augmentation; or rely on the hybrid's WORLD input for timbre |
+| The melody must be an annotated rendition of the same song (Exp 2 used other singers' renditions, §10.8) | automatic lyric-to-note alignment, so any melody with the right syllable count can be used |
+| Fully automatic timing still costs 0.9 dB MCD vs reference timing, even with phrase timing (§10.8) | condition the duration model on the melody's note onsets inside each phrase |
 | Speaker similarity below real singing (0.35 vs 0.44) | a reference encoder over the speaker's spoken mel; more speakers (e.g. NHSS) |
-| Small data (40 training songs) → early overfitting | pitch-shift / tempo augmentation, stronger regularisation |
-| Objective metrics only | MUSHRA-style listening test (≥ 10 listeners), per `approach.md` §7 |
+| Small data (40 training songs) → early overfitting | EMA, speaker-embedding noise and a lower learning rate were tried (§10.7); each only moved along the MCD–speaker trade-off. Next: pitch-shift / tempo augmentation, more singers |
+| Objective metrics only | MUSHRA-style listening test (≥ 10 listeners), per `approach.md` §7; the demo clips are ready for it |
+| Ablations and GAN runs are single-seed | repeat with 3 seeds; fix the training length to separate the input effect from early stopping |
 | MCD is MFCC-style, frame-aligned | DTW-aligned SPTK MCD for comparison with published work |
 
 
@@ -1059,3 +1316,36 @@ report by `figures/report/make_report_figures.py`).
     singing's 0.44. WORLD's 0.65 sits *above* real singing because it still sounds like the person
     *speaking* — the metric compares against speech.
   - **Overall:** the hybrid is the only system that is good on all three axes at once.
+
+### 15.12 Ablation spectrograms
+
+| | No melody input | No speaker input |
+|---|---|---|
+| **Pure** | ![Pure, no melody](figures/acoustic_nopitch_mel_VKOW_05.png) | ![Pure, no speaker](figures/acoustic_nospk_mel_VKOW_05.png) |
+| **Hybrid** | ![Hybrid, no melody](figures/hybrid_nopitch_mel_VKOW_05.png) | ![Hybrid, no speaker](figures/hybrid_nospk_mel_VKOW_05.png) |
+
+- **What it shows:** the same 10 s of VKOW_05 as §15.10 (top: real singing; bottom: the ablated model).
+- **Pure, no melody:** the harmonics turn into blurred, nearly flat bands. The model guesses an average
+  pitch from the lyrics alone, and the glide around frame 270 disappears. This is the pitch-correlation
+  drop to 0.41 in §10.5.
+- **Pure, no speaker:** clean harmonic lines that follow the melody, glide included, and sharper than the
+  full pure model in §15.10. Removing the unseen speaker's ECAPA embedding helps.
+- **Hybrid, no melody:** the harmonics still follow the melody, glide included, because the pitch is already
+  in the WORLD input. Clear horizontal WORLD-buzz stripes remain in the pauses and upper bins.
+- **Hybrid, no speaker:** crisp harmonics like the full hybrid, still with WORLD's faint buzz in the
+  pauses. The lost speaker identity is not visible here; it shows in the speaker score (0.35 → 0.15).
+
+### 15.13 Spectral accuracy vs speaker identity
+
+![MCD vs speaker similarity of every system](figures/tradeoff_mcd_speaker.png)
+
+- **What it shows:** every system and hybrid variant as one point, with real durations: speaker similarity to the
+  spoken voice (x, right is better) against MCD (y, down is better). Left panel: validation speaker JLEE
+  (including the GAN snapshots of §10.6). Right panel: test speaker VKOW. The dashed line is real singing's
+  similarity.
+- **How to read it:** a variant that beat the final hybrid would sit below and to the right of it. None does.
+  The variants spread along a curve from "accurate spectrum, generic voice" (no speaker / speaker noise,
+  bottom left) to "speech-like voice, WORLD-like spectrum" (lr 1e-4 next to WORLD, right).
+- **The GAN snapshots** (red crosses) sit above the curve: slightly more speaker-like, but clearly worse MCD.
+- **Points right of the dashed line** sound more like the *speech* than real singing does. That is not a goal
+  in itself (§10.3).
