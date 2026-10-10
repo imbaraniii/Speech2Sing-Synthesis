@@ -70,7 +70,44 @@ python scripts/evaluate.py --systems acoustic_oracle acoustic_pred nsf_copysyn w
 python scripts/preprocess.py --components wmel
 CUDA_VISIBLE_DEVICES=1 python scripts/train_acoustic.py --world-input    # -> outputs/hybrid_{oracle,pred}/
 python scripts/evaluate.py --systems hybrid_oracle hybrid_pred --csv results/eval_hybrid.csv
+
+# 12. Ablations: drop the melody or the speaker input (pure and hybrid)
+CUDA_VISIBLE_DEVICES=1 python scripts/train_acoustic.py --no-pitch                  # -> acoustic_nopitch_*
+CUDA_VISIBLE_DEVICES=1 python scripts/train_acoustic.py --world-input --no-speaker  # -> hybrid_nospk_*
+python scripts/evaluate.py --systems acoustic_nopitch_oracle acoustic_nospk_oracle \
+    hybrid_nopitch_oracle hybrid_nospk_oracle --csv results/eval_ablation.csv
+
+# 13. Optional GAN fine-tuning of the hybrid, gated on validation -> results/gan_gate.csv
+#     (saves checkpoints/hybrid_gan.pt only if a snapshot beats the hybrid; none did)
+CUDA_VISIBLE_DEVICES=1 python scripts/finetune_gan.py
+
+# 14. Listening excerpts of every val/test song for all systems -> outputs/demo/
+python scripts/make_demos.py
+
+# 15. Exp 2: the lyrics sung to another singer's melody and to the own melody shifted by -3/0/+3
+#     semitones; WORLD, pure and hybrid x reference/phrase/predicted timing -> results/exp2*.csv
+CUDA_VISIBLE_DEVICES=0 python scripts/exp2_melody.py
 ```
+
+## Inference on new audio
+
+```bash
+python infer.py --speech read/05.wav --speech-phones read/05.txt \
+                --melody sing/05.wav --melody-phones sing/05.txt --out out.wav \
+                [--model hybrid|acoustic|world] [--durations reference|phrase|predicted] \
+                [--transpose -12]
+```
+
+Recomputes every feature from the audio. The two annotations must describe the
+same lyrics: another singer's rendition of the song works too (phones are aligned
+by minimum edit distance; at least 70% must match). The reference singing gives
+the melody (`--transpose` shifts it in semitones) and the timing:
+
+- `reference`: every phone's timing from the reference singing.
+- `phrase`: the duration model times every phone; only the melody's rests (pauses ≥ 0.5 s)
+  stay in place. Best fully automatic option.
+- `predicted`: the duration model's timing, stretched to the melody's length. Needs `checkpoints/{hybrid,acoustic,duration}.pt`
+and the vocoder in `vocoder/`.
 
 > Vocoder weights (OpenVPI NSF-HiFiGAN) are CC BY-NC-SA 4.0: research use only.
 
@@ -123,4 +160,8 @@ Frame rates are documented in `config/extract.yaml` under `frame_rates`
 | `baselines/world_baseline.py` | WORLD speech-to-singing baseline + copy-synthesis |
 | `scripts/evaluate.py` | objective metrics for generated singing |
 | `scripts/train_duration.py` | Phase 2 duration predictor + ratio baselines |
-| `scripts/train_acoustic.py` | Phase 3 Conformer acoustic model (pure or `--world-input` hybrid) + generation |
+| `scripts/train_acoustic.py` | Phase 3 Conformer acoustic model (pure / hybrid / ablations) |
+| `scripts/finetune_gan.py` | validation-gated adversarial fine-tuning of the hybrid |
+| `scripts/make_demos.py` | aligned listening excerpts → `outputs/demo/` |
+| `scripts/exp2_melody.py` | Exp 2: cross-singer melodies and transpositions |
+| `infer.py` | end-to-end inference from raw audio |
