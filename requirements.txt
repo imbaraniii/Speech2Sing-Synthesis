@@ -16,6 +16,7 @@ librosa
 soundfile
 torchcrepe
 pyworld
+setuptools<81  # pyworld 0.3.5 imports pkg_resources, removed in setuptools 81
 speechbrain
 
 # Pretrained models
