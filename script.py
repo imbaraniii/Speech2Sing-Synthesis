@@ -10,9 +10,9 @@
    through (e.g. --transpose -12, --durations phrase, --postfilter none).
 
 English lyrics only; the singing must be vocals only. MFA breaks on paths with spaces, so it
-lives outside the project and runs in a temporary directory:
-    env/micromamba/bin/micromamba create -p ~/mfa-env -c conda-forge montreal-forced-aligner
-plus english_us_arpa.dict and english_us_arpa_acoustic.zip in env/mfa_models/
+lives outside the project (~/mfa-env) and runs in a temporary directory:
+    micromamba create -p ~/mfa-env -c conda-forge montreal-forced-aligner   (or conda create -p ...)
+plus english_us_arpa.dict and english_us_arpa_acoustic.zip in ~/mfa-env/models/
 (https://github.com/MontrealCorpusTools/mfa-models/releases).
 """
 
@@ -91,7 +91,7 @@ def main():
     ap.add_argument("--lyrics", required=True, help="the lyrics (English text)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--mfa", default=str(Path.home() / "mfa-env" / "bin" / "mfa"))
-    ap.add_argument("--mfa-models", default=str(ROOT / "env" / "mfa_models"))
+    ap.add_argument("--mfa-models", default=str(Path.home() / "mfa-env" / "models"))
     args, rest = ap.parse_known_args()
 
     models, lyrics = Path(args.mfa_models), Path(args.lyrics).read_text()
