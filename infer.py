@@ -14,6 +14,7 @@ The reference singing provides the melody F0 (optionally --transpose'd) and the 
                          rests (pauses >= MIN_REST s) stay in place, like rests in a score
   --durations predicted  the duration model's timing, only stretched to the melody's length
 (for the duration model the notes are matched to phones through the reference annotation).
+--postfilter sharpen / sharpen_gv undoes part of the neural mel's over-smoothing (see postfilter).
 
 Needs the trained checkpoints (checkpoints/{hybrid,acoustic,duration}.pt) and the
 vocoder assets in vocoder/ (see features/vocoder.py).
@@ -31,6 +32,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import yaml
+from scipy.ndimage import uniform_filter1d
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -52,6 +54,9 @@ EXTRACT_CFG = yaml.safe_load(open(ROOT / "config" / "extract.yaml"))
 SR = yaml.safe_load(open(ROOT / "config" / "data.yaml"))["sample_rate"]
 SYSTEMS = ("world", "acoustic", "hybrid")
 MIN_REST = 0.5  # s: sung pauses at least this long anchor --durations phrase
+POSTFILTERS = ("none", "sharpen", "sharpen_gv")
+# per-bin std(real)/std(hybrid) of the log-mel over time on JLEE (val), as a piecewise-linear fit
+GV_BINS, GV_RATIO = [0, 64, 80, 92, 127], [1.03, 1.08, 1.21, 1.35, 1.29]
 
 
 def edit_ops(a, b) -> list[tuple]:
@@ -185,11 +190,24 @@ def anchor_rests(durs, mapped_ph) -> np.ndarray:
     return out
 
 
+def postfilter(mel, kind="none") -> np.ndarray:
+    """The neural mel varies less over time than real singing (JLEE: 0.81x the frame-to-frame detail,
+    0.8x the std in the upper bins). sharpen: temporal unsharp mask restoring the detail;
+    sharpen_gv: also stretches every bin around its song mean by GV_RATIO."""
+    if kind == "sharpen_gv":
+        mu = mel.mean(0)
+        mel = mu + np.interp(np.arange(mel.shape[1]), GV_BINS, GV_RATIO) * (mel - mu)
+    if kind in ("sharpen", "sharpen_gv"):
+        mel = mel + 0.25 * (mel - uniform_filter1d(mel, 9, axis=0))
+    return mel.astype(np.float32)
+
+
 def synthesize(speech, read_ph, melody, sing_ph, systems=("hybrid",), durations=("reference",),
-               transpose=0.0, device="cpu", checkpoint=None) -> dict:
+               transpose=0.0, device="cpu", checkpoint=None, post="none") -> dict:
     """{(system, durations): waveform at SR} for every requested system x timing.
 
-    speech/melody: wav paths; read_ph/sing_ph: their phone annotations; transpose: semitones.
+    speech/melody: wav paths; read_ph/sing_ph: their phone annotations; transpose: semitones;
+    post: postfilter for the neural systems.
     """
     mapped, _ = align_phones(read_ph, sing_ph)
     # speech: content + speaker
@@ -222,7 +240,7 @@ def synthesize(speech, read_ph, melody, sing_ph, systems=("hybrid",), durations=
                 continue
             cond = make_conditioning(hub, read_ph, sung_edges, f0, n_frames, spk,
                                      vocoder.mel(world) if system == "hybrid" else None)
-            mel = infer(_acoustic(system, device, checkpoint), to_device(cond, device)).cpu().numpy()
+            mel = postfilter(infer(_acoustic(system, device, checkpoint), to_device(cond, device)).cpu().numpy(), post)
             out[system, timing] = vocoder(mel, cond["f0"])
     return out
 
@@ -243,6 +261,8 @@ def main(args=None):
     ap.add_argument("--checkpoint", help="acoustic checkpoint (default: checkpoints/<model>.pt)")
     ap.add_argument("--durations", choices=["reference", "phrase", "predicted"], default="reference")
     ap.add_argument("--transpose", type=float, default=0.0, help="shift the melody by this many semitones")
+    ap.add_argument("--postfilter", choices=POSTFILTERS, default="none",
+                    help="sharpen the neural mel (less muffled; not applied to --model world)")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(args)
 
@@ -253,10 +273,11 @@ def main(args=None):
                  "the speech and the reference singing must have the same lyrics")
 
     wav = synthesize(args.speech, read_ph, args.melody, sing_ph, (args.model,), (args.durations,),
-                     args.transpose, resolve_device(args.device), args.checkpoint)[args.model, args.durations]
+                     args.transpose, resolve_device(args.device), args.checkpoint,
+                     args.postfilter)[args.model, args.durations]
     write_wav(args.out, wav)
     print(f"{args.out}: {len(wav) / SR:.1f} s ({args.model}, {args.durations} durations, {len(read_ph)} phones, "
-          f"{matched:.0%} matched, transpose {args.transpose:+g})")
+          f"{matched:.0%} matched, transpose {args.transpose:+g}, postfilter {args.postfilter})")
 
 
 if __name__ == "__main__":
