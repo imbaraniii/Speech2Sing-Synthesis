@@ -18,6 +18,12 @@ Ablations: --no-pitch drops the melody input (pitch + voicing embeddings; the
 vocoder still gets F0), --no-speaker drops the ECAPA embedding. They add the
 suffix "_nopitch" / "_nospk" to the run name.
 
+Regularisation (training only; --tag names the run so existing checkpoints stay):
+--ema keeps an exponential moving average of the weights, which is validated and
+saved instead of the raw weights; --spk-noise adds Gaussian noise (in units of the
+per-dimension spread over the training songs) to the ECAPA embedding, so the model
+cannot memorise the 10 training speakers' embeddings.
+
 Writes (val + test speakers), <name> = "acoustic" or "hybrid":
   outputs/<name>_oracle/     annotated sung phone durations
   outputs/<name>_pred/       Phase 2 predicted durations (results/duration_predictions.csv)
@@ -289,6 +295,9 @@ def main(args=None):
                     help="hybrid: refine the WORLD conversion mel (needs cache 'wmel')")
     ap.add_argument("--no-pitch", action="store_true", help="ablation: no melody (pitch/voicing) input")
     ap.add_argument("--no-speaker", action="store_true", help="ablation: no ECAPA speaker input")
+    ap.add_argument("--ema", type=float, default=0.0, help="EMA decay of the weights (0 = off)")
+    ap.add_argument("--spk-noise", type=float, default=0.0, help="training noise on the ECAPA input")
+    ap.add_argument("--tag", default="", help="suffix of the run name")
     args = ap.parse_args(args)
 
     device = "cuda"
@@ -303,7 +312,7 @@ def main(args=None):
 
     t0 = time.time()
     name = ("hybrid" if args.world_input else "acoustic") + ("_nopitch" if args.no_pitch else "") \
-        + ("_nospk" if args.no_speaker else "")
+        + ("_nospk" if args.no_speaker else "") + (f"_{args.tag}" if args.tag else "")
     utts, gpu, train, val = load_data(manifest, cache, args.world_input, device)
     lengths = np.array([len(g["coarse"]) for g in train], dtype=float)
     print(f"loaded {len(utts)} songs ({lengths.sum() / FRAME_RATE / 60:.0f} min train) in {time.time() - t0:.0f}s")
@@ -319,10 +328,17 @@ def main(args=None):
     if not args.generate_only:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.steps, pct_start=0.05)
+        swa = torch.optim.swa_utils
+        ema = swa.AveragedModel(model, multi_avg_fn=swa.get_ema_multi_avg_fn(args.ema), use_buffers=True) \
+            if args.ema else None
+        best_model = ema.module if ema else model
+        spk_std = torch.stack([g["spk"] for g in train]).std(0)
         best, since_best, log, t0 = float("inf"), 0, [], time.time()
         for step in range(1, args.steps + 1):
             model.train()
             b = sample_batch(train, lengths, args.batch, rng)
+            if args.spk_noise:
+                b["spk"] = b["spk"] + args.spk_noise * spk_std * torch.randn_like(b["spk"])
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 pred = model(b["hub"], b["spk"], b["coarse"], b["uv"], b.get("wmel"))
             loss = F.l1_loss(pred.float(), b["mel"])
@@ -331,12 +347,14 @@ def main(args=None):
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             sched.step()
+            if ema:
+                ema.update_parameters(model)
             if step % args.eval_every == 0 or step == args.steps:
-                v = val_l1(model, val)
+                v = val_l1(best_model, val)
                 since_best += 1
                 if v < best:
                     best, since_best = v, 0
-                    torch.save({"state_dict": model.state_dict(), "step": step, "val_l1": v}, ckpt_path)
+                    torch.save({"state_dict": best_model.state_dict(), "step": step, "val_l1": v}, ckpt_path)
                 log.append({"step": step, "train_l1": loss.item(), "val_l1": v})
                 print(f"step {step:6d}  train L1 {loss.item():.4f}  val L1 {v:.4f}  best {best:.4f}  "
                       f"({time.time() - t0:.0f}s, {torch.cuda.max_memory_allocated() / 2**30:.1f} GB)", flush=True)
