@@ -1,7 +1,7 @@
 # Speaker-Preserving Speech-to-Singing Synthesis — Project Report
 
 Complete account of the domain, what has been built, why, how it runs, and what it achieves.
-Status as of 2026-10-11.
+Status as of 2026-10-13.
 
 **How to read this document**
 
@@ -9,26 +9,40 @@ Status as of 2026-10-11.
   rests on, from first principles. Each topic ends with **"In this project"**, linking it to our code
   and numbers.
 - **Part II — The project** describes what was built, the infrastructure, the results and the next steps.
+- **Part III — Viva preparation** collects the questions you are likely to be asked, with short answers that
+  point back to the sections above, and the numbers worth knowing by heart.
+
+**The project in five sentences.** We turn a person's *spoken* lyrics into that person *singing* them to a
+chosen melody. The words come from HuBERT features of the speech, the voice from an ECAPA speaker embedding,
+and the pitch and timing from a reference singing. A Transformer predicts how long each sound is held, and a
+Conformer predicts the sung mel spectrogram, which the NSF-HiFiGAN vocoder turns into audio. Our main idea is
+the *hybrid* model: instead of generating singing from scratch, the Conformer corrects a classical WORLD
+conversion, which keeps the speaker's voice that a purely neural model loses when trained on only ten
+speakers. It works on unseen speakers, on other singers' melodies, and on recordings of our own voices.
 
 | Part I — Domain background | Part II — The project |
 |---|---|
 | B1. How humans produce speech and singing | 1. Objective |
 | B2. Phonetics and prosody | 2. Dataset |
-| B3. Digital audio | 3. System architecture + **input → output walkthrough** |
+| B3. Digital audio | 3. System architecture + **input → output walkthrough** + **your own voice (`script.py`)** |
 | B4. Time–frequency analysis: STFT and spectrograms | 4. Infrastructure |
 | B5. The mel scale and mel spectrograms | 5. Repository layout |
 | B6. Cepstrum, MFCC and MCD | 6. Phase 1 — features |
 | B7. Pitch (F0) and how it is estimated | 7. WORLD baseline |
 | B8. Vocoders: classical (WORLD) and neural (HiFi-GAN, NSF) | 8. Phase 2 — duration model |
 | B9. Speech and singing synthesis systems | 9. Phase 3 — acoustic model |
-| B10. Machine learning foundations | 10. Results (incl. ablations, GAN, regularisation, **Exp 2: a different melody**) |
+| B10. Machine learning foundations | 10. Results (ablations, GAN, regularisation, Exp 2, **post-filter**, **our own voices**) |
 | B11. Sequence models: Transformer and Conformer | 11. Deliverables |
 | B12. Self-supervised speech representations (HuBERT) | 12. How to reproduce |
 | B13. Speaker embeddings (ECAPA-TDNN) | 13. Commit history |
 | B14. Generative models and adversarial training | 14. Limitations and next steps |
-| B15. Hybrid signal-processing + neural systems | |
+| B15. Hybrid signal-processing + neural systems | 15. **Figures explained** |
 | B16. Evaluating synthesized speech and singing | |
-| B17. Glossary | 15. **Figures explained** |
+| B17. Forced alignment and the Montreal Forced Aligner | **Part III — Viva preparation** |
+| B18. Over-smoothing, global variance and post-filters | 16. Likely questions and answers |
+| B19. Aligning two sequences: edit distance and DTW | 17. Key numbers |
+| B20. Music basics: notes, octaves, transposition | |
+| B21. Glossary | |
 
 ---
 
@@ -79,8 +93,9 @@ vowels stretch 2.3–4.4× (`figures/duration_ratio_phones.png`), while consonan
   corpus uses **ARPAbet** symbols (`aa`, `iy`, `k`, `sh`, …) — 41 types here, including silences.
 - **Vowels vs. consonants:** vowels are voiced, open sounds carried by formants; consonants are
   constrictions (stops like `k`, fricatives like `s`, nasals like `m`).
-- **Forced alignment:** finding *when* each phone starts and ends in a recording. NUS-48E provides
-  manual alignments, so we did not need an aligner.
+- **Forced alignment:** finding *when* each phone starts and ends in a recording whose words are known.
+  NUS-48E provides manual alignments; for new recordings (our own voices) the Montreal Forced Aligner
+  computes them (B17).
 - **Prosody:** the "music" of speech — **pitch** (F0 contour), **duration** (timing) and **loudness**.
   Speech-to-singing is essentially **prosody transformation**: keep the words and the voice, replace
   pitch and duration with those dictated by the melody.
@@ -311,7 +326,8 @@ adversarial or diffusion models (B14) are used to restore detail.
 
 **In this project:** both Conformers overfit early (best validation at steps 9,000 and 3,000) with only 40
 training songs, so validation-based checkpointing and early stopping are essential. The generated mels are
-visibly over-smoothed compared with real singing.
+visibly over-smoothed compared with real singing; we measured how (in time, not across frequency) and partly
+undo it with a post-filter (B18, §10.9).
 
 ---
 
@@ -397,7 +413,8 @@ whole utterance into a fixed **speaker embedding** (a "voiceprint").
 - **Diffusion models:** learn to denoise step by step from pure noise. DiffSinger uses one to generate
   detailed mels, at the cost of slower inference.
 - **Why it matters here:** our acoustic models are trained with L1 only, hence over-smoothing (B10).
-  Adding a mel discriminator (the "optional adversarial loss" in `approach.md`) is the standard next step.
+  We tried the standard remedy, a mel discriminator (the "optional adversarial loss" in `approach.md`), in
+  §10.6. It did not pass our validation gate, so the shipped system uses a simple post-filter instead (B18).
 
 ---
 
@@ -450,10 +467,142 @@ Humans remain the final judges:
 
 ---
 
-## B17. Glossary
+## B17. Forced alignment and the Montreal Forced Aligner
+
+**The task.** Given a recording and the words spoken (or sung) in it, find the start and end time of every
+phone. It is called *forced* because the words are known in advance: the aligner never decides *what* was
+said, only *when* each sound happens. Speech recognition, in contrast, has to find the words too.
+
+**Why the system needs it.** Everything in the pipeline is organised by phones:
+- in the **speech**, phone boundaries tell us which speech frames belong to each sound (time warping, §9.1,
+  and HuBERT averaging for the duration model, §8);
+- in the **singing**, they tell us how long each sound is held, i.e. the sung timing.
+
+NUS-48E ships hand-made annotations, but a new recording (your own voice) has none, so we compute them.
+
+**How a classical aligner works** (the Montreal Forced Aligner, MFA, is built on the Kaldi toolkit):
+
+1. **Pronunciation dictionary:** each word is looked up and replaced by its phones, e.g. *singing* →
+   `S IH1 NG IH0 NG`. MFA's `english_us_arpa` dictionary has about 200,000 English words. A word that is not
+   in it (*out of vocabulary*, OOV) cannot be aligned.
+2. **Acoustic model:** a small hidden Markov model (HMM) per phone, usually three states (beginning, middle,
+   end), each with a Gaussian mixture model (GMM) that scores how well a 10 ms frame of MFCC features fits
+   that state. It is trained on a large amount of transcribed English speech.
+3. **One long chain:** the phone HMMs of the whole transcript are linked in order, with optional silences
+   between words.
+4. **Viterbi search:** dynamic programming finds the most likely path through this chain for the given audio,
+   which assigns every frame to one phone state. The phone boundaries follow, at 10 ms resolution. The
+   *beam* limits how many paths are kept; a wider beam (`--beam 100 --retry_beam 400` in our script) lets it
+   accept unusual alignments such as very long sung vowels.
+5. **Speaker adaptation:** a second pass adapts the features to each speaker (fMLLR). That is why our script
+   gives the speech and the singing each their own "speaker" folder.
+
+**Output.** Word and phone tiers in ARPAbet with **stress digits** (`AH0`, `IY1`: 0 = unstressed,
+1 = primary stress, 2 = secondary). We convert them to the NUS-48E format: lowercase, digits removed, and
+every gap becomes `sil`.
+
+**Caveats.**
+- MFA's acoustic model was trained on speech, so singing is harder to align (long vowels, wide pitch). On our
+  own song it still found the same phones in the speech and in the singing for 95–96% of the phones; the
+  rest are mostly pauses, and the edit-distance alignment (B19) tolerates them.
+- MFA's tools break on folder paths that contain spaces (our project lives in ".../speech processing/..."),
+  so `script.py` runs it inside a temporary folder.
+
+**In this project:** `script.py` (§3.2) runs MFA 3.4.3, installed in its own environment at `~/mfa-env`, with
+the `english_us_arpa` dictionary and acoustic model on 16 kHz mono copies of your recordings, and converts
+the result into the two phone files `infer.py` reads.
+
+---
+
+## B18. Over-smoothing, global variance and post-filters
+
+**The problem (recap of B10).** A model trained with an L1 or L2 loss predicts something close to the
+*average* of all plausible outputs. Averaging removes detail: the predicted spectrogram changes less from
+frame to frame and its fine structure is softer. Listeners hear this as **muffled** or "underwater" sound.
+
+**How to measure it.** Compare simple statistics of predicted and real spectrograms of the same songs:
+- **Global variance (GV):** the variance of each mel band over the whole song. Over-smoothed output has a
+  lower GV. This was first described for HMM-based speech synthesis (Toda and Tokuda), where restoring the
+  GV made speech clearly less muffled.
+- **Short-term temporal detail:** how much each frame differs from the average of its neighbours (a
+  high-pass filter over time). Blurred onsets and flattened transitions lower it.
+- **Detail across frequency:** the same high-pass idea along the frequency axis (sharpness of harmonics and
+  formants).
+
+**Post-filters** are fixed operations applied to the predicted spectrogram before the vocoder. They need no
+training:
+- **GV scaling:** stretch each band around its mean, `m' = μ + g · (m − μ)`, with `g` = (standard deviation of
+  real) / (standard deviation of predicted), measured on held-out data.
+- **Unsharp masking** (borrowed from image processing): `m' = m + α · (m − blur(m))`. Whatever differs from
+  the local average (edges, onsets, transitions) is amplified.
+- **Formant enhancement:** the classic post-filter of parametric TTS sharpens peaks *across frequency*. We
+  did not need it, because our detail across frequency already matches real singing.
+
+**The catch.** A post-filter makes the output more contrasted, which tends to sound clearer, but frame-by-frame
+metrics (MCD, L1) punish every deviation from the "safe" average, so they usually get slightly *worse*. The
+GAN in §10.6 had the same problem.
+
+**In this project:** the hybrid's smoothing is *in time*: 0.81× the short-term temporal detail of real singing
+on the validation speaker, with the upper mel bands varying only about 0.8× as much. `infer.py --postfilter`
+offers `sharpen` (unsharp mask) and `sharpen_gv` (GV scaling + unsharp mask). Results in §10.9.
+
+---
+
+## B19. Aligning two sequences: edit distance and DTW
+
+Two versions of the same thing rarely line up exactly, so we need to decide which element of one corresponds
+to which element of the other.
+
+- **Edit distance (Levenshtein):** the minimum number of insertions, deletions and substitutions that turn
+  sequence A into sequence B. It is computed by **dynamic programming** in a table of size |A| × |B|, where
+  each cell holds the best cost of aligning the first *i* elements of A with the first *j* of B.
+  Backtracking through the table gives the alignment itself: which elements match, which were inserted and
+  which were deleted. It works on **discrete symbols**, such as phones.
+- **DTW (dynamic time warping):** the same dynamic-programming idea for **continuous** sequences such as
+  feature frames. Each cell's cost is a distance between two frames, and the path may stretch or compress
+  time. Published MCD numbers usually align frames with DTW first.
+- **Greedy matching** (e.g. Python's `difflib`, which grabs the longest matching block first) is fast but can
+  lock onto the wrong part of a sequence, for example a *repeated chorus*, and then cannot recover.
+
+**In this project:** `infer.align_phones` aligns the speech's phones with the melody singer's phones by edit
+distance (§10.8). Matched phones copy the sung timing; an unmatched stretch shares its sung time in
+proportion to the spoken durations. If fewer than 70% of the phones match, the inputs are rejected as not the
+same lyrics (different songs in the corpus never exceed 56%). `difflib` was tried first and matched only 14%
+of one pair because of a repeated chorus.
+
+---
+
+## B20. Music basics: notes, octaves, transposition
+
+- **Semitone and octave:** Western music divides an **octave** (a doubling of frequency) into **12
+  semitones**. Each semitone multiplies the frequency by 2^(1/12) ≈ 1.059. A4 = 440 Hz, A5 = 880 Hz.
+- **Transposition:** moving a melody up or down by *k* semitones multiplies every F0 value by 2^(k/12). The
+  tune stays the same, only the key changes. *k* = −12 is one octave lower (F0 halved).
+- **Key and vocal range:** every voice has a comfortable range. Typical speaking pitch is about 85–180 Hz for
+  male voices and 165–255 Hz for female voices, and people sing higher than they speak (+5.8 semitones on
+  average in our data, §15.4). A melody written for a high voice can sit an octave above a low speaker's
+  natural range.
+- **Notes, rests and phrases:** a **note** is a pitch held for a duration; a **rest** is a silence in the
+  score; a **phrase** is a sung line between rests. Our phrase-timing mode (§10.8) keeps rests fixed and lets
+  timing vary inside phrases, as a singer reading a score would.
+- **Vibrato:** a periodic pitch wobble of about 5–7 Hz used by trained singers (B1). It is part of the melody
+  F0 we copy from the reference singing.
+- **A cappella:** voice only, without instruments. The system takes pitch and phone timing from the reference
+  singing, so accompaniment would corrupt both. **Source separation** networks such as Demucs split a full
+  mix into vocals, drums, bass and other; we used it only to confirm that our test melody was already
+  vocals-only.
+
+**In this project:** `--transpose` shifts the melody by semitones. Another singer's melody is moved by whole
+octaves towards the speaker (§10.8). On our own voices, a low-voiced speaker needed the melody one octave
+down to sound like themselves (§10.10).
+
+---
+
+## B21. Glossary
 
 | Term | Meaning |
 |---|---|
+| A cappella | singing without instruments |
 | Aperiodicity | how noise-like (vs. harmonic) each frequency band is |
 | ARPAbet | ASCII phone alphabet for English (`aa`, `iy`, `sh`, …) |
 | bf16 | 16-bit floating point used for fast training |
@@ -463,25 +612,38 @@ Humans remain the final judges:
 | Copy-synthesis | analyse real audio, then resynthesize it — a vocoder's upper bound |
 | Cosine similarity | similarity of two vectors' directions (−1…1) |
 | DTW | dynamic time warping: aligns two sequences of different speed |
+| Edit distance (Levenshtein) | minimum insertions, deletions and substitutions between two symbol sequences |
 | Embedding | learned vector representing a discrete item or a whole utterance |
 | F0 | fundamental frequency — the pitch of a voiced sound |
+| Forced alignment | finding when each phone starts and ends, given the words |
 | Formant | resonance of the vocal tract; defines vowels and timbre |
+| Global variance (GV) | variance of each spectral band over a whole utterance; low in over-smoothed output |
 | Harmonic | integer multiple of F0 |
 | Hop | step between successive analysis frames |
 | HuBERT | self-supervised speech model whose middle layers encode phonetic content |
 | L1 / L2 loss | mean absolute / squared error |
+| Leakage | similarity of the output to the *melody singer's* voice (should stay low) |
 | Mel spectrogram | spectrogram on a perceptual frequency scale, log-compressed |
+| MFA | Montreal Forced Aligner, the HMM-based forced aligner we use for new recordings |
 | MCD | mel-cepstral distortion — spectral distance in dB |
 | NSF | neural source-filter vocoder with a sine excitation at F0 |
+| OOV | out-of-vocabulary: a word missing from the pronunciation dictionary |
 | Oracle | using ground-truth values for a component to isolate another |
 | Overfitting | memorizing training data instead of generalizing |
 | Phone / phoneme | smallest distinctive speech sound |
+| Post-filter | fixed operation on the predicted spectrogram that restores detail (no training) |
+| Pronunciation dictionary | table from words to their phone sequences |
 | Prosody | pitch, duration and loudness patterns |
 | Residual | a correction added to an existing estimate |
+| Semitone / octave | 1/12 of an octave (×1.059) / a doubling of frequency |
 | Speaker-disjoint | no speaker appears in more than one of train/val/test |
 | STFT | short-time Fourier transform — frame-by-frame spectrum |
 | SVS / TTS / VC / STS | singing synthesis / text-to-speech / voice conversion / speech-to-singing |
+| Transposition | shifting a melody by k semitones: F0 × 2^(k/12) |
+| Unsharp mask | `m + α(m − blur(m))`: boosts what differs from the local average |
 | Unvoiced | sound without vocal-fold vibration (s, f, sh, silence) |
+| Validation gate | our rule for accepting a variant, decided on the validation speaker only |
+| Viterbi | dynamic-programming search for the most likely state path of an HMM |
 | Vocoder | converts acoustic features (mel, F0) into a waveform |
 | WORLD | classical vocoder: F0 + spectral envelope + aperiodicity |
 
@@ -631,6 +793,65 @@ Audio for every stage is in `outputs/demo/VKOW_05_*.wav`:
    spectrum toward real singing. It still carries some of WORLD's high-frequency buzz.
 6. **Real singing:** the target. Compare the darker, cleaner gaps and the softer upper harmonics.
 
+### 3.2 Running the system on your own voice (`script.py`)
+
+The corpus comes with phone annotations; your own recordings do not. `script.py` adds the missing step,
+forced alignment (B17), and then calls `infer.py`, so three files are enough:
+
+```
+ your speech (any format)  ─┐
+ a cappella singing         ├─► [1] 16 kHz mono copies + the lyrics as transcripts
+ the lyrics (English text) ─┘            │
+                                         ▼
+                            [2] every lyric word in the pronunciation dictionary?  (else: stop, name the word)
+                                         ▼
+                            [3] MFA aligns both recordings (temporary folder, one "speaker" each)
+                                         ▼
+                            [4] MFA output → NUS phone files: <out>_speech.txt, <out>_melody.txt
+                                         ▼
+                            [5] infer.py: align the two phone sequences (edit distance, ≥ 70% must match)
+                                → HuBERT + ECAPA from the speech, Harvest F0 from the singing
+                                → WORLD conversion → hybrid Conformer → post-filter → NSF-HiFiGAN
+                                         ▼
+                                     <out>.wav
+```
+
+```bash
+source env/bin/activate        # once per terminal
+python3 script.py --speech sample/speech.mp3 --melody sample/melody.mp3 \
+                  --lyrics sample/lyrics.txt --out outputs/custom/my_song.wav
+```
+
+| Option (passed on to `infer.py`) | Effect |
+|---|---|
+| `--transpose -12` | sing the melody one octave lower (for a voice far below the singer's) |
+| `--postfilter none / sharpen / sharpen_gv` | strength of the post-filter (§10.9); the script defaults to `sharpen_gv` |
+| `--durations reference / phrase / predicted` | copy the singer's timing (default), or let the duration model time each phrase |
+| `--model hybrid / world / acoustic` | the final hybrid (default), the classical baseline, or the pure model |
+
+**What the inputs must satisfy:**
+- **The same lyrics** in the speech and the singing (otherwise fewer than 70% of the phones match and
+  `infer.py` refuses).
+- **Vocals only** in the singing: accompaniment corrupts the pitch track and the alignment (B20).
+- **English words found in the dictionary:** the script names any missing word, so it can be respelled the way
+  it sounds.
+- **A comfortable key:** if the singer is much higher than the speaker, use `--transpose -12` (§10.10).
+
+**Walkthrough with the first author's recordings:**
+
+| Step | Value |
+|---|---|
+| Speech | 27 s, 48 kHz mono; median speaking pitch 149 Hz |
+| Singing | 53 s a cappella (checked with Demucs: already vocals-only); median 229 Hz, range 124–331 Hz |
+| Lyrics | 9 lines, about 56 words, all in the dictionary |
+| Alignment | 202 phone intervals per recording; 95% of the phones match between speech and singing |
+| Output | 53.0 s, hybrid with reference timing and `sharpen_gv`; about 1 min end to end on the Mac |
+| Scores | F0 correlation 0.965, speaker similarity to the speaker's own speech 0.47 (§10.10) |
+
+**Setup it needs (once):** MFA in its own environment at `~/mfa-env` and its English models in
+`~/mfa-env/models/` (§12). Both live outside the project folder, because MFA breaks on paths with spaces and
+recreating `env/` would delete anything inside it.
+
 ---
 
 ## 4. Infrastructure
@@ -669,19 +890,23 @@ The Mac→server link is slow (~1 MB/s) and drops long transfers. The workaround
 ## 5. Repository layout
 
 ```
+infer.py      inference: speech + phones + reference singing + phones → singing
+              (models, timing modes, cross-singer alignment, transposition, post-filter)
+script.py     one command for your own recordings: MFA alignment, then infer.py (§3.2)
 config/       data.yaml (paths, split), extract.yaml (model + feature parameters)
 data/         annotations.py (phone parser), splits.py, nus_smc.py (index + manifest)
 features/     audio.py (soundfile + resampling), hubert.py, ecapa.py, world_f0.py (Harvest),
               crepe_f0.py (reference only), mel.py, notes.py, vocoder.py (NSF-HiFiGAN), cache.py
 baselines/    world_baseline.py (WORLD speech-to-singing + copy-synthesis)
-scripts/      preprocess.py, verify_splits.py, sanity_check.py, data_study.py,
-              train_duration.py, train_acoustic.py, evaluate.py
-figures/      data study plots, F0 overlay, ECAPA heatmap, duration and mel comparison figures
+scripts/      preprocess.py, verify_splits.py, sanity_check.py, data_study.py, train_duration.py,
+              train_acoustic.py, evaluate.py, finetune_gan.py, exp2_melody.py, make_demos.py
+figures/      data study plots, F0 overlay, ECAPA heatmap, duration, mel and trade-off figures
+report/       ieee_report.tex + figures/: the 5-page IEEE-format paper
 docs          overview.md, approach.md, dataset.md, synthesis_archi.md, README.md, this report
 ```
 
 Git-ignored (reproducible): the corpus, `features/cache/`, `outputs/`, `results/`, `checkpoints/`,
-`vocoder/`, environments.
+`vocoder/`, environments (`env/`). Your own recordings in `sample/` are not committed.
 
 ---
 
@@ -772,6 +997,7 @@ assignment. Arbitrary new melodies need an automatic lyric-to-note aligner.
 | Early stopping | patience 8 evaluations (8k steps) |
 | Vocoder | pretrained NSF-HiFiGAN (44.1 kHz, 128 mels, hop 512), fed predicted mel + melody F0 |
 | Vocoder check | copy-synthesis MCD 1.0 dB vs real singing |
+| Post-filter (optional, inference only) | `sharpen` / `sharpen_gv` on the predicted mel before the vocoder (§10.9) |
 
 ### 9.3 Training runs (GPU 0)
 
@@ -855,7 +1081,7 @@ Both runs overfit early. That's expected with 40 training songs; checkpoints are
 | RQ | Answer |
 |---|---|
 | RQ1 Content | ✅ Time-warped HuBERT carries the lyrics; phone timing lines up in the output |
-| RQ2 Speaker | ⚠️→✅ Fails in the pure model; recovered by the hybrid (0.35 vs 0.44 for real singing) |
+| RQ2 Speaker | ⚠️→✅ Fails in the pure model; recovered by the hybrid (0.35 vs 0.44 for real singing). It also holds for two authors recorded outside the corpus (0.43–0.47 for A; B only in a suitable key, §10.10) |
 | RQ3 Melody | ✅ Hybrid pitch error 13.3 Hz, correlation 0.93 (best of all systems); it also follows another singer's melody or a transposed one (0.90–0.92 correlation, Exp 2, §10.8) without taking on that singer's voice |
 | RQ4 Alignment | ✅ 90.8 ms phone duration error, 34% better than rule-based |
 
@@ -1060,10 +1286,113 @@ the melody is controlled independently of the speaker.
   `predicted` needs anyway to match notes to phones.
 
 **Caveats:**
-- The melody still comes from an annotated rendition of the *same* song. A truly new song needs automatic
-  lyric-to-note alignment (§14).
+- The melody must be a rendition of the *same lyrics*. Since `script.py` (§3.2) it no longer needs a manual
+  annotation (MFA provides it), but a melody with different words still needs lyric-to-note alignment (§14).
 - Exp 2 has no listening test. Leakage and speaker similarity are ECAPA scores, which §10.3 shows are inflated
   for speech-like outputs.
+
+### 10.9 Post-filter — restoring some detail without retraining
+
+`infer.py --postfilter` (background: B18).
+
+**Why.** Listening to the first outputs made from our own voices (§10.10), the verdict was "pretty decent, but
+still muffled and not that clear". The spectrograms of §15.10 show the same softness.
+
+**Diagnosis.** Hybrid vs real singing over all non-silent frames of each speaker's four songs. A ratio of 1.0
+means "as much as real singing":
+
+| Measure (hybrid ÷ real) | Val JLEE | Test VKOW |
+|---|---|---|
+| Variation over time, mel bins 0–31 (low frequencies) | 0.96 | 0.98 |
+| … bins 32–63 | 0.95 | 1.04 |
+| … bins 64–95 | 0.81 | 0.98 |
+| … bins 96–127 (high frequencies) | 0.78 | 0.89 |
+| Frame-to-frame change, bins 96–127 | 0.76 | 0.77 |
+| Short-term temporal detail, all bins | **0.81** | **0.84** |
+| Detail across frequency, all bins | 1.03 | 1.14 |
+
+- **The smoothing is in time:** onsets and transitions are softer (0.81–0.84), most of all in the upper bands.
+- **Across frequency the hybrid is as detailed as real singing** (it inherits WORLD's sharp harmonics), so a
+  classic formant-sharpening post-filter would not help.
+- **The average level of each band** was off in opposite directions for the two speakers (upper bands too quiet
+  for JLEE, too loud for VKOW), so a fixed equaliser was not an option either.
+
+**Method** (B18), applied to the predicted log-mel `M̂` just before the vocoder:
+
+```
+sharpen_gv:  M' = μ + g ⊙ (M̂ − μ)        μ = each band's mean over the song
+             g  = std(real) / std(hybrid) per band, measured on JLEE, as a piecewise-linear fit:
+                  mel bins 0, 64, 80, 92, 127  →  1.03, 1.08, 1.21, 1.35, 1.29
+sharpen:     M̃ = M + 0.25 · (M − average of the surrounding 9 frames)    (after the GV step in sharpen_gv)
+```
+
+Everything was fitted on the validation speaker only. There is no training, and it takes about a millisecond.
+
+**Results** (scored with `scripts/evaluate.py`, run on the Mac):
+
+| Hybrid + | Val MCD ↓ | Val F0 (Hz) ↓ | Val speaker ↑ | Test MCD ↓ | Test F0 (Hz) ↓ | Test F0 (cents) ↓ | Test F0 CORR ↑ | Test speaker ↑ |
+|---|---|---|---|---|---|---|---|---|
+| nothing | **3.64** | **16.0** | 0.401 | **4.12** | 14.4 | 132 | 0.919 | 0.354 |
+| `sharpen` | 3.66 | 16.5 | 0.435 | **4.12** | **14.1** | **130** | **0.923** | 0.385 |
+| `sharpen_gv` | 3.75 | 17.0 | **0.465** | 4.21 | 15.3 | 137 | 0.912 | **0.426** |
+
+The unfiltered test F0 RMSE is 14.4 Hz here against 13.3 Hz in §10.1: the Mac runs the model in 32-bit floats and
+the server in bf16, and the tiny waveform differences move a few Harvest pitch frames (as in §10.6). MCD and
+speaker similarity agree to three decimals.
+
+**What this shows:**
+- **`sharpen` is almost free:** test MCD +0.003 dB, pitch unchanged (slightly better), speaker similarity +0.03.
+- **`sharpen_gv` raises speaker similarity the most** (+0.06 on validation, +0.07 on test, reaching 0.43 against
+  0.44 for real singing), for +0.1 dB MCD and about 1 Hz more pitch error.
+- **Neither passes the validation gate,** because the validation MCD rises. So the reported system (§10.1 and
+  Table I of the IEEE paper) stays unfiltered, and the post-filter is an option. `script.py` defaults to
+  `sharpen_gv` because for your own song the voice matters most; `--postfilter none` turns it off.
+- **Sharper spectra raise the speaker score,** exactly as with the GAN (§10.6): ECAPA reacts to the detail the L1
+  model averages away. Whether the result also *sounds* better needs a listening test.
+- **It treats the symptom, not the cause.** Fine-tuning the vocoder on the hybrid's own mels, or a GAN or
+  diffusion decoder, would address the cause (§14).
+
+![Post-filter spectrograms](figures/report/postfilter_VKOW_05.png)
+
+(Explained in §15.14.)
+
+### 10.10 Our own voices — outside the corpus
+
+Two of the authors recorded themselves reading the lyrics of an English song (about 27 s each, 48 kHz mono),
+and a 53-s a cappella recording of the song served as the melody. Everything ran through `script.py` (§3.2):
+automatic alignment, the hybrid model, and the singer's timing. Nothing was tuned on these recordings.
+
+| Speaker | Speaking pitch | Key | Post-filter | F0 CORR ↑ | F0 RMSE (cents) ↓ | Similarity to own speech ↑ | Similarity to the other author ↓ |
+|---|---|---|---|---|---|---|---|
+| A (1st author) | 149 Hz | singer's | none | **0.980** | **100** | 0.428 | **0.018** |
+| | | singer's | `sharpen_gv` | 0.965 | 141 | **0.470** | 0.107 |
+| B (3rd author) | 112 Hz | singer's | none | **0.977** | 122 | 0.293 | 0.364 |
+| | | singer's | `sharpen_gv` | 0.960 | **115** | 0.382 | 0.357 |
+| | | −12 st | none | 0.953 | 132 | 0.303 | 0.275 |
+| | | −12 st | `sharpen_gv` | 0.924 | 141 | **0.391** | **0.257** |
+
+**Reference points:** the melody singer's own voice scores 0.098 against A's speech and 0.039 against B's; A's and
+B's speech score 0.307 against each other; real singing of the test speaker scores 0.44 against that speaker's
+speech. The singer's median pitch is 229 Hz.
+
+**What this shows:**
+- **The melody is followed** on real-world recordings: F0 correlation 0.92–0.98 and 100–141 cents, as good as or
+  better than on the corpus (Exp 2: 141–166 cents).
+- **The voice is the speaker's, never the singer's.** The singer's voice is almost unrelated to either author
+  (≤ 0.10), while the outputs reach 0.29–0.47 against the speaker's own speech.
+- **A's output is clearly A:** 0.43 to A against 0.02 to B (unfiltered), as close as real singing is to the test
+  speaker's speech.
+- **The key matters.** B speaks at 112 Hz, about an octave below the singer.
+  - In the singer's key, the unfiltered output was nearer A's voice (0.36) than B's own (0.29).
+  - One octave down, with the post-filter, it is clearly B (0.39 against 0.26).
+  - For A, whose voice is higher, the singer's key worked better (an earlier octave-down run of A scored 0.37).
+  - A melody far above a speaker's range pulls the output away from that voice, so choosing the octave
+    automatically is a next step (§14).
+- **The post-filter raised the speaker score in every case** (+0.04 to +0.09), with a pitch cost in three of
+  the four cases (up to +41 cents).
+- **Caveats:** two speakers, one song, objective scores only.
+
+Audio: `outputs/custom/` and `outputs/pranav/` (git-ignored).
 
 ---
 
@@ -1072,13 +1401,16 @@ the melody is controlled independently of the speaker.
 | Item | Location |
 |---|---|
 | Demo clips: all 8 val/test songs × 10 versions, same 25 s lyric window (spoken input → WORLD → pure → hybrid → real singing) | `outputs/demo/` (Mac), `scripts/make_demos.py` |
-| Inference CLI: spoken lyrics + reference singing (any singer, transposable) → the speaker singing, from raw audio | `infer.py` |
+| Inference CLI: spoken lyrics + reference singing (any singer, transposable, optional post-filter) → the speaker singing, from raw audio | `infer.py` |
+| One-command run on your own recordings (speech + a cappella singing + lyrics) with automatic MFA alignment | `script.py` (§3.2) |
+| Our own voices sung by the system (§10.10) | `outputs/custom/`, `outputs/pranav/` (Mac) |
+| IEEE-format paper (5 pages) | `report/ieee_report.tex` + `report/figures/` |
 | Exp 2: 44 different-melody conditions × 3 systems × 3 timings | `outputs/exp2/` (server), `results/exp2{,_summary}.csv` |
 | Exp 2 listening excerpts (25 s): cross-singer and ±3 semitone examples | `outputs/exp2_demo/` (Mac) |
 | Full generated songs | `outputs/{world,world_pred,acoustic_*,hybrid_*,nsf_copysyn}/` |
 | Metrics | `results/eval*.csv` (incl. `eval_ablation*.csv`, `eval_hybrid_{ema,ema_spk05,ema_spk10,lr1}*.csv`), `results/duration*.csv`, `results/gan_gate.csv` |
 | Training curves | `results/{acoustic,hybrid}{,_nopitch,_nospk}_train.csv` |
-| Figures | `figures/duration_pred_VKOW_05.png`, `figures/{acoustic,hybrid}{,_nopitch,_nospk}_mel_VKOW_05.png`, `figures/tradeoff_mcd_speaker.png`, data study plots |
+| Figures | `figures/duration_pred_VKOW_05.png`, `figures/{acoustic,hybrid}{,_nopitch,_nospk}_mel_VKOW_05.png`, `figures/tradeoff_mcd_speaker.png`, `figures/report/postfilter_VKOW_05.png`, data study plots |
 | Checkpoints | `checkpoints/duration.pt` (Mac), `checkpoints/{acoustic,hybrid}.pt` (server) |
 
 ---
@@ -1086,7 +1418,13 @@ the melody is controlled independently of the speaker.
 ## 12. How to reproduce
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv env && source env/bin/activate
+pip install -r requirements.txt               # pins setuptools<81: pyworld 0.3.5 imports pkg_resources
+
+# MFA, only for your own recordings (§3.2). It lives outside the project because it breaks on paths with spaces.
+micromamba create -p ~/mfa-env -c conda-forge montreal-forced-aligner   # or: conda create -p ~/mfa-env ...
+# then put english_us_arpa.dict and english_us_arpa_acoustic.zip (the english_us_arpa dictionary and
+# acoustic model from https://github.com/MontrealCorpusTools/mfa-models/releases) in ~/mfa-env/models/
 
 # Phase 1 — features (Mac or server)
 python scripts/preprocess.py                  # hubert ecapa crepe f0 mel notes
@@ -1124,7 +1462,12 @@ CUDA_VISIBLE_DEVICES=0 python scripts/exp2_melody.py
 python scripts/make_demos.py
 python infer.py --speech read/05.wav --speech-phones read/05.txt \
                 --melody sing/05.wav --melody-phones sing/05.txt --out out.wav \
-                [--model hybrid|acoustic|world] [--durations reference|phrase|predicted] [--transpose -12]
+                [--model hybrid|acoustic|world] [--durations reference|phrase|predicted] [--transpose -12] \
+                [--postfilter none|sharpen|sharpen_gv]
+
+# Your own voice in one command (§3.2): MFA alignment + infer.py (post-filter sharpen_gv by default)
+python3 script.py --speech sample/speech.mp3 --melody sample/melody.mp3 --lyrics sample/lyrics.txt \
+                  --out outputs/custom/my_song.wav [--transpose -12] [--postfilter none]
 ```
 
 ---
@@ -1132,6 +1475,15 @@ python infer.py --speech read/05.wav --speech-phones read/05.txt \
 ## 13. Commit history
 
 ```
+fix(script): moved the default MFA models to ~/mfa-env/models so recreating env/ keeps them.
+fix(requirements): pinned setuptools below 81 since pyworld 0.3.5 imports pkg_resources.
+feat(script): added script.py that aligns the lyrics with MFA and sings your own speech to a cappella singing in one command.
+feat(infer): added the --postfilter option that sharpens the over-smoothed neural mel for a less muffled output.
+docs(ieee-report): added template for ieee report
+Merge #1 feat/infer-crossMelody
+docs(report): added the regularisation results, the MCD vs speaker trade-off and Exp 2 with rest-anchored phrase timing.
+docs(readme): documented Exp 2 and the cross-singer, transposition and phrase-timing options of infer.py.
+chore(figures): added the MCD vs speaker similarity figure of every system, ablation, GAN snapshot and regularisation variant.
 feat(exp2): added the different-melody experiment on 20 cross-singer pairs and ±3 semitone shifts, where the hybrid follows the new melody (0.90 F0 correlation) without taking on the melody singer's voice (0.09 vs 0.17 speaker similarity).
 feat(infer): aligned another singer's annotation by minimum edit distance and added melody transposition, the WORLD system and rest-anchored phrase timing (own-melody MCD 5.28 to 4.76 dB vs predicted durations).
 chore(figures): added the test-song mel-spectrogram figures of the four melody and speaker ablation models.
@@ -1166,9 +1518,12 @@ chore(git): ignored the dataset, feature cache, environments and generated artif
 
 | Limitation | Next step |
 |---|---|
-| Output is somewhat over-smoothed / muffled (an L1-loss artefact) | A mel GAN fine-tune was tried (§10.6) and made every objective metric except speaker similarity worse. Next: judge the GAN versions by listening, or try a GAN-trained / diffusion decoder instead of fine-tuning |
+| Output is somewhat over-smoothed / muffled (an L1-loss artefact) | A mel GAN fine-tune (§10.6) made every metric except speaker similarity worse; the post-filter (§10.9) partly restores detail at a small MCD and pitch cost. Next: fine-tune the vocoder on the hybrid's own mels, or a diffusion decoder; judge by listening |
 | ECAPA conditioning fails for unseen speakers in the pure model (§10.5) | more training speakers; speaker augmentation; or rely on the hybrid's WORLD input for timbre |
-| The melody must be an annotated rendition of the same song (Exp 2 used other singers' renditions, §10.8) | automatic lyric-to-note alignment, so any melody with the right syllable count can be used |
+| The melody must be a vocals-only rendition of the same lyrics (MFA now annotates it automatically, §3.2) | automatic lyric-to-note alignment, so a melody with different words or a MIDI file can be used |
+| A key far from the speaker's range weakens the voice (speaker B, §10.10) | choose the octave automatically from the speaker's and the singer's median F0 |
+| English only, and every lyric word must be in MFA's dictionary | a grapheme-to-phoneme model for unknown words; MFA models for other languages |
+| The own-voice test has two speakers and one song | more volunteers and songs, with a listening test |
 | Fully automatic timing still costs 0.9 dB MCD vs reference timing, even with phrase timing (§10.8) | condition the duration model on the melody's note onsets inside each phrase |
 | Speaker similarity below real singing (0.35 vs 0.44) | a reference encoder over the speaker's spoken mel; more speakers (e.g. NHSS) |
 | Small data (40 training songs) → early overfitting | EMA, speaker-embedding noise and a lower learning rate were tried (§10.7); each only moved along the MCD–speaker trade-off. Next: pitch-shift / tempo augmentation, more singers |
@@ -1298,8 +1653,8 @@ report by `figures/report/make_report_figures.py`).
   evenly across frequencies — not a tonal hum).
 - **Hybrid:** much crisper, more defined harmonics (inherited from WORLD), so pitch accuracy and speaker
   identity improve. But it also inherits WORLD's buzz: harmonic stripes reaching the top bins and faint
-  stripes in the pauses, where real singing is breathier and softer. This is the main quality issue to
-  address next (adversarial loss, B14).
+  stripes in the pauses, where real singing is breathier and softer. This is the main quality issue: the
+  adversarial fine-tune (§10.6) did not fix it, and the post-filter (§10.9, §15.14) only partly does.
 
 ### 15.11 Results comparison
 
@@ -1349,3 +1704,256 @@ report by `figures/report/make_report_figures.py`).
 - **The GAN snapshots** (red crosses) sit above the curve: slightly more speaker-like, but clearly worse MCD.
 - **Points right of the dashed line** sound more like the *speech* than real singing does. That is not a goal
   in itself (§10.3).
+
+### 15.14 What the post-filter does
+
+![Post-filter spectrograms](figures/report/postfilter_VKOW_05.png)
+
+- **What it shows:** 10 s of the test song VKOW_05 as vocoder log-mels (low frequencies at the bottom), from top to
+  bottom: real singing, the hybrid, the hybrid with `sharpen`, and with `sharpen_gv` (§10.9).
+- **How to read it:** compare the *contrast*. Bright = loud, dark = quiet; sharp vertical edges are onsets,
+  horizontal lines are harmonics.
+- **Takeaway:**
+  - The hybrid's pause at 4.5–6 s is filled with a grey noise floor, where the real singing is almost black.
+  - `sharpen` makes onsets crisper; `sharpen_gv` also darkens the quiet parts and stretches the upper bands'
+    contrast, so the picture gets closer to real singing.
+  - What the filter cannot do is invent detail that is missing, such as the breathy texture of real singing or
+    the exact shape of each harmonic. That is why MCD does not improve.
+
+---
+
+# Part III — Viva preparation
+
+## 16. Likely questions and answers
+
+Short answers you can give out loud, with the section that holds the details.
+
+### The problem
+
+**Q1. What does the project do, in one sentence?**
+It turns a person's *spoken* lyrics into that person *singing* them to a melody chosen independently, so no
+recording of the person singing is needed (§1).
+
+**Q2. Why is this hard?**
+Three things change between speech and singing: timing (sung vowels are held for notes; 2.3× longer on
+average), pitch (free glides become stable notes, usually higher) and voice quality (a singing resonance),
+while the voice must stay recognisably the same person (§1, B1).
+
+**Q3. How is it different from text-to-speech, singing synthesis and voice conversion?**
+TTS makes speech from text; singing voice synthesis (SVS) makes singing from lyrics and a score but needs hours
+of the target singer; voice conversion changes *who* speaks but keeps speech prosody. Speech-to-singing keeps the
+words and the voice and replaces the prosody (pitch and timing) with the melody's (B9).
+
+### Data
+
+**Q4. Which data, and why?**
+NUS-48E: 12 speakers (6 female, 6 male), each reading and singing four English songs, 48 pairs, about 169 min,
+with hand-made phone annotations for both versions. It is one of the very few corpora where the *same person*
+both reads and sings the *same lyrics*, which is what a speech-to-singing model needs to learn from (§2).
+
+**Q5. How did you split it, and why that way?**
+By speaker: 10 for training (40 songs), JLEE for validation and VKOW for testing. Neither of the last two is
+ever seen in training, so every result is on a *new voice*, the realistic case (B10, §2).
+
+**Q6. What did you learn from the data before modelling?**
+(1) Spoken and sung phone sequences match one to one, which gives the exact sung length of every phone.
+(2) CREPE-tiny failed on half the singers (54% of sung vowels got a note), so we switched to Harvest (99.8%).
+(3) Two singers' versions of the same song share only 77–89% of their phones, which needed a proper alignment
+(§2, §10.8).
+
+### Features
+
+**Q7. Why HuBERT, and why layer 9?**
+HuBERT is a self-supervised speech model; its middle-to-late layers encode *what* is said and carry little of
+*who* says it, which is what a content input should do. Layer 9 of HuBERT-base is a common choice for this; we
+did not compare layers (B12).
+
+**Q8. Why ECAPA-TDNN, and how do you know it works?**
+It is a speaker-verification model that turns an utterance into a 192-number voiceprint. After fixing a bug (it
+was fed 44.1 kHz instead of 16 kHz), recordings of the same speaker score 0.93 and different speakers 0.14, so it
+separates voices well (B13, §6).
+
+**Q9. Why Harvest and not CREPE for pitch?**
+CREPE-tiny produced near-zero confidence and two-octave errors on about half of the singers. WORLD's Harvest gave
+a note to 99.8% of the sung vowels (B7, §6).
+
+**Q10. Why predict a 128-band log-mel at 44.1 kHz?**
+That is exactly the format the pretrained NSF-HiFiGAN vocoder expects, computed with its own STFT, so the model's
+output can be vocoded directly (B5, §9).
+
+### Models
+
+**Q11. What does the duration model do?**
+For each spoken phone it predicts how long that phone is sung, from the phone's identity, its spoken length,
+its HuBERT features and the note it falls on. It is a 2-layer Transformer (393k parameters) trained on log
+durations. Test error: 90.8 ms per phone, 34% better than the best rule, with the notes contributing 15% (§8).
+
+**Q12. Why predict durations in the log domain?**
+Durations are positive and spread over two orders of magnitude (30 ms consonants to 3 s notes). In log space a
+20% error counts the same for short and long phones. The downside: the longest notes tend to be
+under-predicted (§15.8).
+
+**Q13. How do you put speech features on the singing timeline?**
+Phone-by-phone linear time warping: a singing frame at time *t* inside phone *k* is mapped to the speech time
+`s(t) = τ_k + (t − T_k)·(τ_{k+1} − τ_k)/(T_{k+1} − T_k)`, where `T` and `τ` are the sung and spoken phone
+boundaries, and the HuBERT features are interpolated there (§9.1, §15.7).
+
+**Q14. What is the difference between the pure and the hybrid model?**
+Both are the same 6-layer Conformer with the same inputs. The pure model predicts the sung mel from scratch.
+The hybrid also receives the mel of a WORLD conversion of the speech and only predicts a *correction*:
+output = WORLD mel + correction (B15, §9).
+
+**Q15. Why does the hybrid keep the voice when the pure model does not?**
+With only 10 training speakers, the pure model never learns to *produce* an unseen voice from its ECAPA
+embedding, so it falls back to an average voice (speaker similarity 0.00 on test). The WORLD conversion already
+contains the speaker's real spectral envelope, so the hybrid starts from the right voice and only learns what
+makes it sound sung (0.35 on test, against 0.44 for real singing) (§10.3).
+
+**Q16. Why initialise the correction layer to zero?**
+So the hybrid starts *exactly* at the WORLD output and training can only move it towards real singing. Its
+validation L1 starts at WORLD's 1.536 and drops to 1.114 (B15, §15.9).
+
+**Q17. Why a Conformer?**
+It combines self-attention (long-range context such as a whole phrase) with convolution (local detail such as
+onsets and formant transitions), and it is the standard encoder for speech (B11).
+
+**Q18. Which vocoder, and why pretrained?**
+OpenVPI's NSF-HiFiGAN at 44.1 kHz. It receives the F0 explicitly through a sine source, which suits singing's
+precise pitch. Training a vocoder needs far more data than we have; its copy-synthesis MCD of 1.0 dB shows it
+is not what limits our quality (B8, §9).
+
+**Q19. Why an L1 loss, and what does it cost?**
+L1 is simple, stable and standard for mel regression. Its cost is over-smoothing: the model predicts an average,
+which sounds muffled (B10, B18).
+
+### Evaluation
+
+**Q20. What is MCD, and can it be compared with papers?**
+Mel-cepstral distortion: the distance between the cepstra (spectral envelopes) of output and reference, in dB,
+lower is better. Ours is MFCC-style and frame-aligned on the melody's timeline (no DTW), so it ranks our own
+systems consistently but its absolute values are not comparable with SPTK-based numbers in papers (B6, §10).
+
+**Q21. Real singing only scores 0.44 speaker similarity. Is that not a sign the metric is broken?**
+No. The metric compares with the speaker's *spoken* voice, and singing changes the voice (higher pitch,
+different resonance). So 0.44 is the realistic target, and WORLD's 0.66 is *not* better: it scores high because
+it still sounds like speech (B16, §10.3).
+
+**Q22. What are "oracle" and "predicted" durations?**
+Oracle (reference) uses the true sung durations, to judge the acoustic model alone. Predicted uses the duration
+model, which makes the system fully automatic. The frame-aligned MCD rises by 1.2–2.0 dB with predicted timing
+partly because timing errors are counted as spectral errors (B9, §10.1).
+
+**Q23. What is your validation gate, and why have one?**
+A variant replaces the hybrid only if, on the *validation* speaker, its MCD goes down, its F0 RMSE rises by at
+most 0.5 Hz and its speaker similarity drops by at most 0.01. The test speaker is never used for decisions.
+Deciding on the test data would make the test results optimistic (§10.6).
+
+**Q24. The pure model has the lowest MCD. Why is it not your final system?**
+Because it loses the speaker completely (0.00) and follows the pitch worst (correlation 0.74). MCD rewards an
+"average" spectrum; the project's goal is the speaker's voice on a given melody, where the hybrid is the only
+system that is good on all three axes (§10.3, §15.11).
+
+### Experiments
+
+**Q25. What did the ablations show?**
+Without the melody input the pure model cannot follow the pitch (correlation 0.74 → 0.41), while the hybrid
+hardly notices because WORLD already carries the melody. Removing ECAPA *improves* the pure model's pitch (an
+unseen embedding confuses it) but halves the hybrid's speaker score (0.35 → 0.15). So in the hybrid, ECAPA is what
+holds the voice (§10.5).
+
+**Q26. You tried a GAN. Why did it fail?**
+A patch discriminator on mel crops pushed the output towards sharper detail, but that detail cannot be predicted
+exactly frame by frame, so MCD rose (3.64 → 4.07–4.55) while speaker similarity rose only slightly (+0.02–0.05).
+No snapshot passed the gate. Whether it *sounds* better would need a listening test (§10.6).
+
+**Q27. What did the regularisation experiments show?**
+EMA, noise on the speaker embedding and a lower learning rate all moved along one curve: lower MCD always came
+with lower speaker similarity. None beat the hybrid on both, which points to the 10 training speakers as the real
+bottleneck (§10.7, §15.13).
+
+**Q28. Does it work with a melody from someone else?**
+Yes (Exp 2). With another singer's rendition the hybrid's pitch error stays within 25 cents of the own-melody
+value (166 cents, correlation 0.90), and within 4 cents for ±3-semitone shifts (§10.8).
+
+**Q29. How do you know the output does not just copy the melody singer's voice?**
+We measure *leakage*: similarity to the melody singer's speech. It is 0.086, below the 0.166 between the two
+singers' own voices, in 18 of 20 pairs. The melody only provides F0 and timing (§10.8).
+
+**Q30. What is phrase timing?**
+Fully predicted timing drifts over a song (phrases start 2.8 s off). Phrase timing keeps the melody's rests
+(pauses ≥ 0.5 s) in place and rescales the predicted durations inside each phrase. Drift drops to 0.33 s and the
+hybrid's automatic MCD from 5.28 to 4.76 dB (§10.8).
+
+**Q31. What is the post-filter, and why is it not in the main results?**
+A fixed operation on the predicted mel: stretch each band's variation over time to real singing's level, then
+sharpen over time (unsharp mask). On the test speaker it raises speaker similarity from 0.35 to 0.43 for +0.1 dB
+MCD. It fails the validation gate (MCD rises), so it is an option, default only in `script.py` (§10.9).
+
+**Q32. Does it work on a real new voice?**
+Yes, on two authors recorded outside the corpus: pitch correlation 0.92–0.98, and the first author's output
+scores 0.43–0.47 against that author's speech (real singing on the test speaker: 0.44), while the melody
+singer's own voice scores only 0.10 (§10.10).
+
+**Q33. Why did the third author's voice need the melody an octave lower?**
+That voice speaks at 112 Hz, about an octave below the singer (229 Hz). Rendered an octave above the speaker's
+range, the output drifted towards another voice (0.36 to the first author against 0.29 to the speaker); an octave
+down it was clearly the speaker (0.39 against 0.26) (§10.10).
+
+### Practical use
+
+**Q34. What do I need to run it on a new song?**
+Three files: you reading the lyrics, a vocals-only singing of the same lyrics, and the lyrics as text. Then
+`python3 script.py --speech … --melody … --lyrics … --out …`. It aligns the lyrics with MFA and runs the hybrid
+with the post-filter (§3.2).
+
+**Q35. How long do training and inference take?**
+Training: 6 minutes for the hybrid and 23 minutes for the pure model on one RTX 6000 Ada; the duration model
+trains in minutes. Inference: about 20 s for a 1-minute song on a MacBook (M4), plus about half a minute for
+the MFA alignment (§9.3, §3.2).
+
+**Q36. Can it handle other languages, humming or a MIDI file?**
+Not yet. MFA needs a dictionary and an acoustic model for the language (ours is English). Humming or MIDI has no
+lyrics to align, which would need lyric-to-note alignment; the F0 itself could come from any source (§14).
+
+### Limits, ethics and next steps
+
+**Q37. What are the main limitations?**
+The output is still somewhat muffled with a little WORLD buzz; speaker similarity is below real singing (0.35 vs
+0.44); automatic timing costs 0.9 dB; the melody must have the same lyrics; a key far from the speaker's range
+weakens the voice; and all results are objective, single runs, on four unseen speakers (§14).
+
+**Q38. What would you do next?**
+A listening test (at least ten listeners); choosing the key automatically; more training speakers (e.g. NHSS)
+or speaker augmentation; a speaker reference encoder; fine-tuning the vocoder on the hybrid's mels or a diffusion
+decoder for the muffling; onset-aware duration prediction (§14).
+
+**Q39. Are there ethical concerns?**
+Yes: the system imitates a person's voice, so it should only be used on voices whose owners agree (our own-voice
+tests used two of the authors). The NUS-48E data and the OpenVPI vocoder weights (CC BY-NC-SA 4.0) are for
+research and non-commercial use only, and songs used as melodies may be copyrighted.
+
+**Q40. What is the single most important finding?**
+With little data, *correcting* a classical conversion beats generating from scratch: the WORLD-residual hybrid
+keeps the speaker's voice that a purely neural model loses, and every attempt to push spectral accuracy further
+traded the voice away (the MCD–speaker trade-off, §15.13).
+
+---
+
+## 17. Key numbers
+
+| What | Number |
+|---|---|
+| Corpus | 12 speakers, 48 read/sung pairs, 20 songs, ~169 min (54 spoken, 114 sung) |
+| Split | 10 train speakers (40 songs) / JLEE validation / VKOW test |
+| Phone durations | median 0.06 s spoken vs 0.11 s sung; sung phones 2.3× longer on average |
+| Pitch tracker | CREPE-tiny 54% of sung vowels with a note → Harvest 99.8% |
+| ECAPA check | same speaker 0.93, different speakers 0.14 |
+| Model sizes | duration 393k; pure 9.48M; hybrid 9.52M parameters |
+| Training | hybrid 6 min, best at step 3,000; pure 23 min, best at step 9,000 |
+| Duration error (test) | 90.8 ms per phone; −34% vs best rule; notes −15% |
+| Test results (MCD / F0 RMSE / F0 corr / speaker) | WORLD 4.32 / 17.6 Hz / 0.891 / 0.657; pure 3.73 / 29.2 / 0.739 / 0.000; **hybrid 4.12 / 13.3 / 0.931 / 0.354** |
+| References | real singing speaker similarity 0.436; vocoder copy-synthesis MCD 1.01 dB |
+| Exp 2 (other singer, hybrid) | 166 cents, correlation 0.899, speaker 0.408, leakage 0.086 (vs 0.166) |
+| Phrase timing | hybrid automatic MCD 5.28 → 4.76 dB; drift 2.8 s → 0.33 s |
+| Post-filter (`sharpen_gv`, test) | speaker 0.354 → 0.426, MCD +0.09 dB |
+| Own voices | A: correlation 0.98, 100 cents, speaker 0.43 (0.47 filtered); B: 0.39 one octave down, filtered |
